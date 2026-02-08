@@ -70,7 +70,6 @@ ham_data_u = ham_handler.build_measurement_intermediates(
 )
 
 prop_data_u = prop_handler_u.init_prop_data(trial_u, wave_data_u, ham_data_u, seed)
-# prop_data_u["key"] = random.PRNGKey(seed)
 prop_data_u["overlaps"] = trial_u.calc_overlap(prop_data_u["walkers"], wave_data_u)
 
 fields = random.normal(
@@ -165,14 +164,14 @@ def test_propagate_cpmc():
     prop_data_new_slow = prop_handler_cpmc_slow.propagate_constrained(
         trial_cpmc_u, ham_data_u, prop_data_cpmc, fields, wave_data_u
     )
-    assert np.allclose(
+    np.testing.assert_allclose(
         prop_data_new_slow["walkers"].data[0], prop_data_new["walkers"].data[0]
     )
-    assert np.allclose(
+    np.testing.assert_allclose(
         prop_data_new_slow["walkers"].data[1], prop_data_new["walkers"].data[1]
     )
-    assert np.allclose(prop_data_new_slow["weights"], prop_data_new["weights"])
-    assert np.allclose(prop_data_new_slow["overlaps"], prop_data_new["overlaps"])
+    np.testing.assert_allclose(prop_data_new_slow["weights"], prop_data_new["weights"])
+    np.testing.assert_allclose(prop_data_new_slow["overlaps"], prop_data_new["overlaps"])
 
 
 def test_propagate_cpmc_nn():
@@ -194,18 +193,18 @@ def test_propagate_cpmc_nn():
     )
     assert prop_data_new["weights"].shape == prop_data_u["weights"].shape
     assert prop_data_new["overlaps"].shape == prop_data_u["overlaps"].shape
-    prop_data_cpmc["key"] = random.PRNGKey(seed)
+    prop_data_cpmc["hs_constant_onsite"] = prop_data_cpmc["hs_constant"]
     prop_data_new_slow = prop_handler_cpmc_nn_slow.propagate_constrained(
         trial_cpmc_u, ham_data_u, prop_data_cpmc, fields, wave_data_u
     )
-    assert np.allclose(
+    np.testing.assert_allclose(
         prop_data_new_slow["walkers"].data[0], prop_data_new["walkers"].data[0]
     )
-    assert np.allclose(
+    np.testing.assert_allclose(
         prop_data_new_slow["walkers"].data[1], prop_data_new["walkers"].data[1]
     )
-    assert np.allclose(prop_data_new_slow["weights"], prop_data_new["weights"])
-    assert np.allclose(prop_data_new_slow["overlaps"], prop_data_new["overlaps"])
+    np.testing.assert_allclose(prop_data_new_slow["weights"], prop_data_new["weights"])
+    np.testing.assert_allclose(prop_data_new_slow["overlaps"], prop_data_new["overlaps"])
 
 
 if __name__ == "__main__":
