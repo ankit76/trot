@@ -874,7 +874,7 @@ class propagator_cpmc_slow(propagator_cpmc):
 
 @dataclass
 class propagator_cpmc_nn(propagator_cpmc):
-    neighbors: Optional[tuple] = None
+    neighbors: Optional[Tuple] = None
 
     def init_prop_data(
         self,
@@ -929,6 +929,7 @@ class propagator_cpmc_nn(propagator_cpmc):
                 hs_constants[0] - 1,
             )
             ratio_0 = jnp.where(ratio_0 < tol, 0.0, ratio_0)
+            carry["node_crossings"] += jnp.sum(jnp.array(ratio_0) == 0.0)
 
             # field 2
             ratio_1 = trial.calc_overlap_ratio(
@@ -938,6 +939,7 @@ class propagator_cpmc_nn(propagator_cpmc):
             )
 
             ratio_1 = jnp.where(ratio_1 < tol, 0.0, ratio_1)
+            carry["node_crossings"] += jnp.sum(jnp.array(ratio_0) == 0.0)
 
             # normalize
             prob_0 = ratio_0.real / 2.0
@@ -1095,7 +1097,7 @@ class propagator_cpmc_nn(propagator_cpmc):
 
 @dataclass
 class propagator_cpmc_nn_slow(propagator_cpmc):
-    neighbors: Optional[tuple] = None
+    neighbors: Optional[Tuple] = None
 
     def init_prop_data(
         self,

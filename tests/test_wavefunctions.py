@@ -124,6 +124,8 @@ ham_data_g["ene0"] = ham_data["ene0"]
 
 uhf_cpmc = wavefunctions.uhf_cpmc(norb, nelec_sp)
 
+neighbors = tuple((i, (i + 1) % norb) for i in range(norb))
+uhf_cpmc_nn = wavefunctions.uhf_cpmc_nn(norb, nelec_sp, neighbors=neighbors)
 
 def test_rhf_overlap():
     overlap = rhf._calc_overlap_restricted(walker, wave_data)
@@ -264,25 +266,93 @@ def test_uhf_cpmc():
     green = uhf_cpmc._calc_green_full_unrestricted(walker_up, walker_dn, wave_data_u)
     assert green[0].shape == (norb, norb)
     assert green[1].shape == (norb, norb)
+
+    update_indices = jnp.array([[0, 3], [1, 3]])
     wick_ratio = uhf_cpmc._calc_overlap_ratio(
         green,
-        jnp.array([[0, 3], [1, 3]]),
+        update_indices,
         hs_constant[0] - 1,
     )
-    overlap_0 = uhf_cpmc._calc_overlap_unrestricted(walker_up, walker_dn, wave_data_u)
-    new_walker_0 = walker_up.at[3, :].mul(hs_constant[0, 0])
-    new_walker_1 = walker_dn.at[3, :].mul(hs_constant[0, 1])
-    ratio = uhf_cpmc._calc_overlap_unrestricted(new_walker_0, new_walker_1, wave_data_u) / overlap_0
+    overlap = uhf_cpmc._calc_overlap_unrestricted(walker_up, walker_dn, wave_data_u)
+    new_walker_up = walker_up.at[update_indices[0, 1], :].mul(hs_constant[0, 0])
+    new_walker_dn = walker_dn.at[update_indices[1, 1], :].mul(hs_constant[0, 1])
+    ratio = uhf_cpmc._calc_overlap_unrestricted(new_walker_up, new_walker_dn, wave_data_u) / overlap
     assert np.allclose(ratio, wick_ratio)
 
-    new_green = uhf_cpmc._calc_green_full_unrestricted(new_walker_0, new_walker_1, wave_data_u)
+    new_green = uhf_cpmc._calc_green_full_unrestricted(new_walker_up, new_walker_dn, wave_data_u)
     new_green_wick = uhf_cpmc._update_green(
         green,
         ratio,
-        jnp.array([[0, 3], [1, 3]]),
+        update_indices,
         hs_constant[0] - 1,
     )
     assert np.allclose(new_green, new_green_wick)
+
+
+def test_uhf_cpmc_nn():
+    u = 4.0
+    u_1 = 1.0
+    dt = 0.005
+    gamma = jnp.arccosh(jnp.exp(dt * u / 2))
+    const = jnp.exp(-dt * u / 2)
+    hs_constant = const * jnp.array(
+        [[jnp.exp(gamma), jnp.exp(-gamma)], [jnp.exp(-gamma), jnp.exp(gamma)]]
+    )
+    gamma_1 = jnp.arccosh(jnp.exp(dt * u_1 / 2))
+    const_1 = jnp.exp(-dt * u_1 / 2)
+    hs_constant_nn = const_1 * jnp.array(
+        [
+            [jnp.exp(gamma_1), jnp.exp(-gamma_1)],
+            [jnp.exp(-gamma_1), jnp.exp(gamma_1)],
+        ]
+    )
+    green = uhf_cpmc_nn._calc_green_full_unrestricted(walker_up, walker_dn, wave_data_u)
+    assert green[0].shape == (norb, norb)
+    assert green[1].shape == (norb, norb)
+
+    # onsite interactions
+    update_indices = jnp.array([[0, 3], [1, 3]])
+    wick_ratio = uhf_cpmc_nn._calc_overlap_ratio(
+        green,
+        update_indices,
+        hs_constant[0] - 1,
+    )
+    overlap = uhf_cpmc_nn._calc_overlap_unrestricted(walker_up, walker_dn, wave_data_u)
+    new_walker_up = walker_up.at[update_indices[0, 1], :].mul(hs_constant[0, 0])
+    new_walker_dn = walker_dn.at[update_indices[1, 1], :].mul(hs_constant[0, 1])
+    ratio = uhf_cpmc_nn._calc_overlap_unrestricted(new_walker_up, new_walker_dn, wave_data_u) / overlap
+    assert np.allclose(ratio, wick_ratio)
+    new_green = uhf_cpmc._calc_green_full_unrestricted(new_walker_up, new_walker_dn, wave_data_u)
+    new_green_wick = uhf_cpmc._update_green(
+        green,
+        ratio,
+        update_indices,
+        hs_constant[0] - 1,
+    )
+    assert np.allclose(new_green, new_green_wick)
+
+    # nearest-neighbor interactions
+    update_indices = jnp.array([[0, 3], [1, 4]])
+    wick_ratio_nn = uhf_cpmc_nn._calc_overlap_ratio(
+        new_green,
+        update_indices,
+        hs_constant_nn[0] - 1,
+    )
+    overlap_nn = uhf_cpmc_nn._calc_overlap_unrestricted(new_walker_up, new_walker_dn, wave_data_u)
+    new_walker_nn_up = new_walker_up.at[update_indices[0, 1], :].mul(hs_constant_nn[0, 0])
+    new_walker_nn_dn = new_walker_dn.at[update_indices[1, 1], :].mul(hs_constant_nn[0, 1])
+    ratio_nn = uhf_cpmc_nn._calc_overlap_unrestricted(
+        new_walker_nn_up, new_walker_nn_dn, wave_data_u
+    ) / overlap_nn
+    assert np.allclose(ratio_nn, wick_ratio_nn)
+    new_green_nn = uhf_cpmc_nn._calc_green_full_unrestricted(new_walker_nn_up, new_walker_nn_dn, wave_data_u)
+    new_green_wick_nn = uhf_cpmc_nn._update_green(
+        new_green,
+        ratio_nn,
+        update_indices,
+        hs_constant_nn[0] - 1,
+    )
+    assert np.allclose(new_green_nn, new_green_wick_nn)
 
 
 def test_multislater():
@@ -511,6 +581,7 @@ if __name__ == "__main__":
     test_noci_energy()
     test_noci_get_rdm1()
     test_uhf_cpmc()
+    test_uhf_cpmc_nn()
     test_multislater()
     test_cisd()
     test_ucisd()

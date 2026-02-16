@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial, reduce, singledispatchmethod
 from itertools import product
 from typing import Any, List, Literal, Optional, Sequence, Tuple, Union
@@ -1623,6 +1623,67 @@ class uhf_cpmc(uhf, wave_function_cpmc):
 
 
 @dataclass
+class uhf_cpmc_nn(uhf_cpmc):
+    """Class for the unrestricted Hartree-Fock wave function for NN-CPMC.
+
+    The corresponding wave_data contains "mo_coeff", a list of two jax.Arrays of shape (norb, nelec[sigma]).
+    The measurement methods make use of half-rotated integrals which are stored in ham_data.
+    ham_data should contain "rot_h1" and "rot_chol" intermediates which are the half-rotated
+    one-body and two-body integrals respectively.
+
+    Attributes:
+        norb: Number of orbitals.
+        nelec: Number of electrons of each spin.
+        n_opt_iter: Number of optimization scf iterations.
+    """
+
+    neighbors: Tuple[Tuple[int, int], ...] = field(default_factory=tuple)
+    neighbors_ij: jnp.ndarray = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        self.neighbors_ij = jnp.asarray(self.neighbors, dtype=jnp.int32)
+
+    @partial(jit, static_argnums=0)
+    def _calc_energy_unrestricted(
+        self,
+        walker_up: jax.Array,
+        walker_dn: jax.Array,
+        ham_data: dict,
+        wave_data: dict,
+    ) -> jax.Array:
+        green = self._calc_green_full_unrestricted(walker_up, walker_dn, wave_data)
+        h1 = ham_data["h1"]
+        u = ham_data["u"]
+        u_1 = ham_data["u_1"]
+        energy_1 = jnp.sum(green[0] * h1[0]) + jnp.sum(green[1] * h1[1])
+
+        # onsite interactions
+        energy_2 = u * jnp.sum(green[0].diagonal() * green[1].diagonal())
+
+        # nearest-neighbor interactions
+        i = self.neighbors_ij[:, 0] 
+        j = self.neighbors_ij[:, 1] 
+        green_tot = green[0].diagonal() + green[1].diagonal()
+        hartree = green_tot[i] * green_tot[j]
+        exchange = green[0][i, j] * green[0][j, i] + green[1][i, j] * green[1][j, i]
+        energy_2 += u_1 * jnp.sum(hartree - exchange)
+
+        return energy_1 + energy_2
+
+    def __hash__(self) -> int:
+        # return hash(tuple(self.__dict__.values()))
+        items = []
+        for k, v in self.__dict__.items():
+            # skip JAX arrays
+            if hasattr(v, "shape") and type(v).__module__.startswith("jax"):
+                continue
+
+            items.append((k, v))
+        
+        return hash(tuple(items))
+
+
+@dataclass
 class ghf_complex(wave_function):
     """Class for the complex-valued generalized Hartree-Fock wave function.
 
@@ -2155,6 +2216,113 @@ class ghf_cpmc(ghf, wave_function_cpmc):
 
     def __hash__(self) -> int:
         return hash(tuple(self.__dict__.values()))
+
+
+@dataclass
+class ghf_cpmc_nn(ghf_cpmc):
+    """Class for the generalized Hartree-Fock wave function for NN-CPMC.
+
+    The corresponding wave_data contains "mo_coeff", a list of two jax.Arrays of shape (norb, nelec[sigma]).
+    The measurement methods make use of half-rotated integrals which are stored in ham_data.
+    ham_data should contain "rot_h1" and "rot_chol" intermediates which are the half-rotated
+    one-body and two-body integrals respectively.
+
+    Attributes:
+        norb: Number of orbitals.
+        nelec: Number of electrons of each spin.
+        n_opt_iter: Number of optimization scf iterations.
+    """
+
+    neighbors: Tuple[Tuple[int, int], ...] = field(default_factory=tuple)
+    neighbors_ij: jnp.ndarray = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        self.neighbors_ij = jnp.asarray(self.neighbors, dtype=jnp.int32)
+
+    @partial(jit, static_argnums=0)
+    def _calc_energy_unrestricted(
+        self,
+        walker_up: jax.Array,
+        walker_dn: jax.Array,
+        ham_data: dict,
+        wave_data: dict,
+    ) -> jax.Array:
+        green = self._calc_green_full_unrestricted(walker_up, walker_dn, wave_data)
+        green_uu = green[: self.norb, : self.norb]
+        green_ud = green[: self.norb, self.norb :]
+        green_du = green[self.norb :, : self.norb]
+        green_dd = green[self.norb :, self.norb :]
+
+        h1 = ham_data["h1"]
+        u = ham_data["u"]
+        u_1 = ham_data["u_1"]
+        energy_1 = jnp.sum(green_uu * h1[0]) + jnp.sum(green_dd * h1[1])
+
+        # onsite interactions
+        energy_2 = u * (
+            jnp.sum(green_uu.diagonal() * green_dd.diagonal())
+            - jnp.sum(green_ud.diagonal() * green_du.diagonal())
+        )
+
+        # nearest-neighbor interactions
+        i = self.neighbors_ij[:, 0] 
+        j = self.neighbors_ij[:, 1] 
+        green_tot = green_uu.diagonal() + green_dd.diagonal()
+        hartree = green_tot[i] * green_tot[j]
+        exchange = (
+            green_uu[i, j] * green_uu[j, i] + green_ud[i, j] * green_du[j, i]
+            + green_du[i, j] * green_ud[j, i] + green_dd[i, j] * green_dd[j, i]
+        )
+        energy_2 += u_1 * jnp.sum(hartree - exchange)
+
+        return energy_1 + energy_2
+
+    @partial(jit, static_argnums=0)
+    def _calc_energy_generalized(
+        self, walker: jax.Array, ham_data: dict, wave_data: dict
+    ) -> jax.Array:
+        green = self._calc_green_full_generalized(walker, wave_data)
+        green_uu = green[: self.norb, : self.norb]
+        green_ud = green[: self.norb, self.norb :]
+        green_du = green[self.norb :, : self.norb]
+        green_dd = green[self.norb :, self.norb :]
+
+        h1 = ham_data["h1"]
+        u = ham_data["u"]
+        u_1 = ham_data["u_1"]
+        energy_1 = jnp.sum(green_uu * h1[0]) + jnp.sum(green_dd * h1[1])
+
+        # onsite interactions
+        energy_2 = u * (
+            jnp.sum(green_uu.diagonal() * green_dd.diagonal())
+            - jnp.sum(green_ud.diagonal() * green_du.diagonal())
+        )
+
+        # nearest-neighbor interactions
+        i = self.neighbors_ij[:, 0] 
+        j = self.neighbors_ij[:, 1] 
+        green_tot = green_uu.diagonal() + green_dd.diagonal()
+        hartree = green_tot[i] * green_tot[j]
+        exchange = (
+            green_uu[i, j] * green_uu[j, i] + green_ud[i, j] * green_du[j, i]
+            + green_du[i, j] * green_ud[j, i] + green_dd[i, j] * green_dd[j, i]
+        )
+        energy_2 += u_1 * jnp.sum(hartree - exchange)
+
+        return energy_1 + energy_2
+
+
+    def __hash__(self) -> int:
+        # return hash(tuple(self.__dict__.values()))
+        items = []
+        for k, v in self.__dict__.items():
+            # skip JAX arrays
+            if hasattr(v, "shape") and type(v).__module__.startswith("jax"):
+                continue
+
+            items.append((k, v))
+        
+        return hash(tuple(items))
 
 
 @dataclass

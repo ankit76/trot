@@ -1335,6 +1335,7 @@ def get_options(options: Dict):
         "noci",
         "cisd",
         "ucisd",
+        "ghf",
         "ghf_complex",
         "gcisd_complex",
         "UCISD",

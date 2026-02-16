@@ -550,8 +550,8 @@ class triangular_grid(lattice):
         elif self.boundary == "pbc":
             n1 = (pos[0], (pos[1] + 1) % self.l_y)
             n3 = (pos[0], (pos[1] - 1) % self.l_y)
-            n5 = ((pos[0] + 1) % self.l_x, (pos[1] + 1) % self.l_y)
-            n6 = ((pos[0] - 1) % self.l_x, (pos[1] - 1) % self.l_y)
+            n5 = ((pos[0] + 1) % self.l_x, (pos[1] - 1) % self.l_y)
+            n6 = ((pos[0] - 1) % self.l_x, (pos[1] + 1) % self.l_y)
             n2 = ((pos[0] + 1) % self.l_x, pos[1])
             n4 = ((pos[0] - 1) % self.l_x, pos[1])
 
@@ -564,6 +564,11 @@ class triangular_grid(lattice):
             n4 = (pos[0] - 1, pos[1])
 
         return jnp.array([n1, n2, n3, n4, n5, n6])
+
+    def get_neighboring_bonds(self, adjacency_matrix):
+        # k = 1 excludes diagonal.
+        i, j = np.where(np.triu(adjacency_matrix, k=1) != 0)
+        return np.column_stack((i, j))
 
     def create_adjacency_matrix(self):
         width, height = self.l_y, self.l_x
