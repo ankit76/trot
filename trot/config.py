@@ -152,7 +152,7 @@ def setup_jax(
 
     # resolve auto-detection before touching JAX
     if use_gpu is None:
-        use_gpu = _detect_gpu()
+        use_gpu = _detect_gpu() and os.environ.get("JAX_PLATFORM_NAME") != "cpu"
     afqmc_config.use_gpu = use_gpu
 
     # env vars only take effect if JAX hasn't been imported yet

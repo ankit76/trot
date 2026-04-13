@@ -13,24 +13,24 @@ from ..core.system import System
 @tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class UhfTrial:
-    mo_coeff_a: jax.Array  # (norb, nocc[0])
-    mo_coeff_b: jax.Array  # (norb, nocc[1])
+    mo_a: jax.Array  # (norb, nocc[0])
+    mo_b: jax.Array  # (norb, nocc[1])
 
     @property
     def norb(self) -> int:
-        return int(self.mo_coeff_a.shape[0])
+        return int(self.mo_a.shape[0])
 
     @property
     def nocc(self) -> tuple[int, int]:
-        return (int(self.mo_coeff_a.shape[1]), int(self.mo_coeff_b.shape[1]))
+        return (int(self.mo_a.shape[1]), int(self.mo_b.shape[1]))
 
     def tree_flatten(self):
-        return (self.mo_coeff_a, self.mo_coeff_b), None
+        return (self.mo_a, self.mo_b), None
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        mo_coeff_a, mo_coeff_b = children
-        return cls(mo_coeff_a=mo_coeff_a, mo_coeff_b=mo_coeff_b)
+        mo_a, mo_b = children
+        return cls(mo_a=mo_a, mo_b=mo_b)
 
 
 def _det(m: jax.Array) -> jax.Array:
@@ -38,8 +38,8 @@ def _det(m: jax.Array) -> jax.Array:
 
 
 def get_rdm1(trial_data: UhfTrial) -> jax.Array:
-    c_a = trial_data.mo_coeff_a
-    c_b = trial_data.mo_coeff_b
+    c_a = trial_data.mo_a
+    c_b = trial_data.mo_b
     dm_a = c_a @ c_a.conj().T  # (norb, norb)
     dm_b = c_b @ c_b.conj().T  # (norb, norb)
     return jnp.stack([dm_a, dm_b], axis=0)  # (2, norb, norb)
@@ -53,15 +53,15 @@ def overlap_r(walker: jax.Array, trial_data: UhfTrial) -> jax.Array:
 
 def overlap_u(walker: tuple[jax.Array, jax.Array], trial_data: UhfTrial) -> jax.Array:
     wu, wd = walker
-    cu = trial_data.mo_coeff_a.conj().T @ wu  # (nocc[0], nocc[0])
-    cd = trial_data.mo_coeff_b.conj().T @ wd  # (nocc[1], nocc[1])
+    cu = trial_data.mo_a.conj().T @ wu  # (nocc[0], nocc[0])
+    cd = trial_data.mo_b.conj().T @ wd  # (nocc[1], nocc[1])
     return _det(cu) * _det(cd)
 
 
 def overlap_g(walker: jax.Array, trial_data: UhfTrial) -> jax.Array:
     norb = trial_data.norb
-    caH = trial_data.mo_coeff_a.conj().T  # (nocc[0], norb)
-    cbH = trial_data.mo_coeff_b.conj().T  # (nocc[1], norb)
+    caH = trial_data.mo_a.conj().T  # (nocc[0], norb)
+    cbH = trial_data.mo_b.conj().T  # (nocc[1], norb)
     top = caH @ walker[:norb, :]  # (nocc[0], sum(nocc))
     bot = cbH @ walker[norb:, :]  # (nocc[1], sum(nocc))
     m = jnp.vstack([top, bot])  # (sum(nocc), sum(nocc))

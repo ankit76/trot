@@ -31,7 +31,7 @@ def _make_uhf_trial(key, norb, nup, ndn, dtype=jnp.complex128) -> UhfTrial:
     ka, kb = jax.random.split(key)
     ca = testing.rand_orthonormal_cols(ka, norb, nup, dtype=dtype)
     cb = testing.rand_orthonormal_cols(kb, norb, ndn, dtype=dtype)
-    return UhfTrial(mo_coeff_a=ca, mo_coeff_b=cb)
+    return UhfTrial(mo_a=ca, mo_b=cb)
 
 
 @pytest.mark.parametrize(
