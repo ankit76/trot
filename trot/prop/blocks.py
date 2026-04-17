@@ -298,6 +298,8 @@ def block_fp(
     """
     propagation + measurement
     """
+    assert params.n_prop_steps % params.n_qr_blocks == 0
+
     step_fp = lambda st: prop_ops.step(
         st,
         params=params,
@@ -313,7 +315,19 @@ def block_fp(
         carry = step_fp(carry)
         return carry, None
 
-    state, _ = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
+    def _qr_blocks(state: PropState, _x: Any):
+        state, _ = lax.scan(
+            _scan_step, state, xs=None, length=params.n_prop_steps // params.n_qr_blocks
+        )
+        wk_kind = sys.walker_kind.lower()
+        q, norms = wk.orthogonalize(state.walkers, wk_kind)
+        weights_new = state.weights * norms.real
+        state = state._replace(weights=weights_new, walkers=q)
+        return state, None
+
+    # state, _ = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
+    state, _ = lax.scan(_qr_blocks, state, xs=None, length=params.n_qr_blocks)
+
     overlaps_new = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
         state.walkers, trial_data
     )
@@ -325,7 +339,7 @@ def block_fp(
 
     thresh = jnp.sqrt(2.0 / jnp.asarray(params.dt))
 
-    e_samples = jnp.where(jnp.abs(e_samples - params.ene0) > thresh, params.ene0, e_samples)
+    e_samples = jnp.where(jnp.abs(e_samples - params.ene0) > thresh, params.ene0, e_samples)  # type: ignore
     e_samples = jnp.array(e_samples)
 
     weights = state.weights

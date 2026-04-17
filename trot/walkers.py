@@ -179,6 +179,36 @@ def orthonormalize(w: walkers, walker_kind: str) -> walkers:
     return w_new
 
 
+def qr_norm(w: walkers, walker_kind: str) -> jax.Array:
+    """
+    QR computing only R
+    """
+
+    def _wrapper(mat: jax.Array):
+        r = jnp.linalg.qr(mat, mode="r")
+        d = jnp.diag(r)
+        abs_d = jnp.abs(d)
+        phase = d / jnp.where(abs_d == 0, 1.0, abs_d)
+        r = phase[:, None] * r  # check this is correct for free projection
+        det_r = jnp.prod(jnp.diag(r))
+        return det_r
+
+    wk = walker_kind.lower()
+
+    if wk == "unrestricted":
+        wu, wd = w
+        det_u = jax.vmap(_wrapper, in_axes=0)(wu)
+        det_d = jax.vmap(_wrapper, in_axes=0)(wd)
+        norm = det_u * det_d
+        return norm
+    elif wk in ("restricted", "generalized"):
+        det_r = jax.vmap(_wrapper, in_axes=0)(w)
+        norm = det_r * det_r if wk == "restricted" else det_r
+        return norm
+
+    raise ValueError(f"unknown walker_kind: {walker_kind}")
+
+
 def multiply_constants(w: walkers, constants: jax.Array, walker_kind: str) -> walkers:
     """
     Distribute a per walker constant across walker columns.

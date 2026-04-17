@@ -21,8 +21,8 @@ def _half_green_from_overlap_matrix(w: jax.Array, ovlp_mat: jax.Array) -> jax.Ar
 
 
 def _build_bra_generalized(trial_data: UhfTrial) -> jax.Array:
-    Atrial = trial_data.mo_coeff_a
-    Btrial = trial_data.mo_coeff_b
+    Atrial = trial_data.mo_a
+    Btrial = trial_data.mo_b
     bra = jnp.block([[Atrial, 0 * Btrial], [0 * Atrial, Btrial]])
     return bra
 
@@ -47,8 +47,8 @@ def force_bias_kernel_uw_rh(
     trial_data: UhfTrial,
 ) -> jax.Array:
     wu, wd = walker
-    mu = trial_data.mo_coeff_a.conj().T @ wu
-    md = trial_data.mo_coeff_b.conj().T @ wd
+    mu = trial_data.mo_a.conj().T @ wu
+    md = trial_data.mo_b.conj().T @ wd
     gu = _half_green_from_overlap_matrix(wu, mu)  # (nocc[0], norb)
     gd = _half_green_from_overlap_matrix(wd, md)  # (nocc[1], norb)
 
@@ -101,12 +101,12 @@ def rdm1_kernel_uw(
     trial_data: UhfTrial,
 ) -> jax.Array:
     wu, wd = walker
-    mu = trial_data.mo_coeff_a.conj().T @ wu
-    md = trial_data.mo_coeff_b.conj().T @ wd
+    mu = trial_data.mo_a.conj().T @ wu
+    md = trial_data.mo_b.conj().T @ wd
     gu = _half_green_from_overlap_matrix(wu, mu)
     gd = _half_green_from_overlap_matrix(wd, md)
-    dm_a = gu.T @ trial_data.mo_coeff_a.conj().T
-    dm_b = gd.T @ trial_data.mo_coeff_b.conj().T
+    dm_a = gu.T @ trial_data.mo_a.conj().T
+    dm_b = gd.T @ trial_data.mo_b.conj().T
     return jnp.stack([dm_a, dm_b], axis=0)
 
 
@@ -121,8 +121,8 @@ def rdm1_kernel_gw(
     na, _ = trial_data.nocc
     bra = _build_bra_generalized(trial_data)
     g = _half_green_from_overlap_matrix(w, bra.T.conj() @ w)
-    dm_a = g[:na, :norb].T @ trial_data.mo_coeff_a.conj().T
-    dm_b = g[na:, norb:].T @ trial_data.mo_coeff_b.conj().T
+    dm_a = g[:na, :norb].T @ trial_data.mo_a.conj().T
+    dm_b = g[na:, norb:].T @ trial_data.mo_b.conj().T
     return jnp.stack([dm_a, dm_b], axis=0)
 
 
@@ -151,12 +151,12 @@ def density_corr_kernel_uw(
     trial_data: UhfTrial,
 ) -> jax.Array:
     wu, wd = walker
-    mu = trial_data.mo_coeff_a.conj().T @ wu
-    md = trial_data.mo_coeff_b.conj().T @ wd
+    mu = trial_data.mo_a.conj().T @ wu
+    md = trial_data.mo_b.conj().T @ wd
     gu = _half_green_from_overlap_matrix(wu, mu)
     gd = _half_green_from_overlap_matrix(wd, md)
-    ga = gu.T @ trial_data.mo_coeff_a.conj().T
-    gb = gd.T @ trial_data.mo_coeff_b.conj().T
+    ga = gu.T @ trial_data.mo_a.conj().T
+    gb = gd.T @ trial_data.mo_b.conj().T
     return _density_corr_from_greens(ga, gb)
 
 
@@ -184,8 +184,8 @@ def density_corr_kernel_gw(
     na, _ = trial_data.nocc
     bra = _build_bra_generalized(trial_data)
     g = _half_green_from_overlap_matrix(w, bra.T.conj() @ w)
-    ga = g[:na, :norb].T @ trial_data.mo_coeff_a.conj().T
-    gb = g[na:, norb:].T @ trial_data.mo_coeff_b.conj().T
+    ga = g[:na, :norb].T @ trial_data.mo_a.conj().T
+    gb = g[na:, norb:].T @ trial_data.mo_b.conj().T
     return _density_corr_from_greens(ga, gb)
 
 
@@ -209,8 +209,8 @@ def energy_kernel_uw_rh(
     trial_data: UhfTrial,
 ) -> jax.Array:
     wu, wd = walker
-    mu = trial_data.mo_coeff_a.conj().T @ wu
-    md = trial_data.mo_coeff_b.conj().T @ wd
+    mu = trial_data.mo_a.conj().T @ wu
+    md = trial_data.mo_b.conj().T @ wd
     gu = _half_green_from_overlap_matrix(wu, mu)
     gd = _half_green_from_overlap_matrix(wd, md)
 
@@ -318,8 +318,8 @@ class UhfMeasCtx:
 def build_meas_ctx(ham_data: HamChol, trial_data: UhfTrial) -> UhfMeasCtx:
     if ham_data.basis != "restricted":
         raise ValueError("UHF MeasOps currently assumes HamChol.basis == 'restricted'.")
-    caH = trial_data.mo_coeff_a.conj().T  # (nocc[0], norb)
-    cbH = trial_data.mo_coeff_b.conj().T  # (nocc[1], norb)
+    caH = trial_data.mo_a.conj().T  # (nocc[0], norb)
+    cbH = trial_data.mo_b.conj().T  # (nocc[1], norb)
     rot_h1_a = caH @ ham_data.h1  # (nocc[0], norb)
     rot_h1_b = cbH @ ham_data.h1  # (nocc[1], norb)
     rot_chol_a = jnp.einsum("pi,gij->gpj", caH, ham_data.chol, optimize="optimal")

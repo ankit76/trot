@@ -1049,8 +1049,8 @@ def _stage_ucisd_input(obj: StagedMfOrCc) -> TrialInput:
     mob = _uhf_input.data["mo_b"]
 
     data = {
-        "mo_coeff_a": np.asarray(moa),
-        "mo_coeff_b": np.asarray(mob),
+        "mo_a": np.asarray(moa),
+        "mo_b": np.asarray(mob),
         "ci1a": np.asarray(t1a),
         "ci1b": np.asarray(t1b),
         "ci2aa": np.asarray(ci2aa),

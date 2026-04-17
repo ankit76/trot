@@ -858,11 +858,7 @@ def run_qmc_fp(
     block_e_all = jnp.zeros((params.n_traj, params.n_blocks + 1)) + 0.0j
     block_w_all = jnp.zeros((params.n_traj, params.n_blocks + 1)) + 0.0j
     total_sign = jnp.ones((params.n_traj, params.n_blocks + 1)) + 0.0j
-    block_e_all = block_e_all.at[:, 0].set(jnp.array(state.e_estimate))
-    block_w_all = block_w_all.at[:, 0].set(jnp.sum(state.weights))
-    total_sign = total_sign.at[:, 0].set(
-        jnp.sum(state.overlaps) / (jnp.sum(jnp.abs(state.overlaps)))
-    )
+
     chunk = print_every
     for i in range(params.n_traj):
         print("Trajectory count", i + 1)
@@ -877,6 +873,12 @@ def run_qmc_fp(
                 meas_ops=meas_ops,
                 params=params,
             )
+
+        block_e_all = block_e_all.at[i, 0].set(jnp.array(state.e_estimate))
+        block_w_all = block_w_all.at[i, 0].set(jnp.sum(state.weights))
+        total_sign = total_sign.at[i, 0].set(
+            jnp.sum(state.overlaps) / (jnp.sum(jnp.abs(state.overlaps)))
+        )
 
         n = params.n_blocks
         state, scalars_chunk, _obs = run_blocks(
