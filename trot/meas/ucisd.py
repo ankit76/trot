@@ -21,8 +21,8 @@ def _half_green_from_overlap_matrix(w: jax.Array, ovlp_mat: jax.Array) -> jax.Ar
 
 def _build_bra_generalized(trial_data: UcisdTrial) -> jax.Array:
     n_oa, n_ob = trial_data.nocc
-    c_a = trial_data.mo_coeff_a
-    c_b = trial_data.mo_coeff_b
+    c_a = trial_data.mo_a
+    c_b = trial_data.mo_b
 
     Atrial, Btrial = (
         c_a[:, :n_oa],
@@ -44,7 +44,7 @@ def _build_bra_generalized(trial_data: UcisdTrial) -> jax.Array:
 
 def _get_generalized_walker_in_alpha_basis(walker: jax.Array, trial_data: UcisdTrial) -> jax.Array:
     norb = trial_data.norb
-    c_b = trial_data.mo_coeff_b
+    c_b = trial_data.mo_b
 
     w = jnp.vstack(
         [walker[:norb], c_b.T @ walker[norb:, :]]
@@ -156,7 +156,7 @@ def force_bias_kernel_uw_rh(
     c2aa = trial_data.c2aa
     c2ab = trial_data.c2ab
     c2bb = trial_data.c2bb
-    c_b = trial_data.mo_coeff_b
+    c_b = trial_data.mo_b
 
     cfg = meas_ctx.cfg
 
@@ -481,7 +481,7 @@ def energy_kernel_uw_rh(
     c2aa = trial_data.c2aa
     c2ab = trial_data.c2ab
     c2bb = trial_data.c2bb
-    c_b = trial_data.mo_coeff_b
+    c_b = trial_data.mo_b
 
     cfg = meas_ctx.cfg
 
@@ -1253,8 +1253,8 @@ def build_meas_ctx(
     if ham_data.basis != "restricted":
         raise ValueError("UCISD MeasOps currently assumes HamChol.basis == 'restricted'.")
     n_oa, n_ob = trial_data.nocc
-    cb = trial_data.mo_coeff_b  # (norb, nocc[1])
-    cbH = trial_data.mo_coeff_b.conj().T  # (nocc[1], norb)
+    cb = trial_data.mo_b  # (norb, nocc[1])
+    cbH = trial_data.mo_b.conj().T  # (nocc[1], norb)
     h1_b = 0.5 * (cbH @ (ham_data.h1 + ham_data.h1.T) @ cb)
     chol_b = jnp.einsum("pi,gij,jq->gpq", cbH, ham_data.chol, cb)
     rot_h1_a = ham_data.h1[:n_oa, :]  # (nocc[0], norb)

@@ -81,8 +81,8 @@ def _make_ucisd_trial(
     c_b = testing.rand_orthonormal_cols(k6, norb, norb, dtype=jnp.float64)
 
     return UcisdTrial(
-        mo_coeff_a=c_a,
-        mo_coeff_b=c_b,
+        mo_a=c_a,
+        mo_b=c_b,
         c1a=c1a,
         c1b=c1b,
         c2aa=c2aa,

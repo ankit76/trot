@@ -40,11 +40,26 @@ def afqmc_step_fp(
     )(state.walkers, fields, prop_ctx, 10)
 
     walkers_new = wk.multiply_constants(walkers_new, constants, wk_kind)
-    q, norms = wk.orthogonalize(walkers_new, wk_kind)
+
+    # Version with normal qr
+    # q, norms = wk.orthogonalize(walkers_new, wk_kind)
+    # weights_new = state.weights * norms.real
+    # key, subkey = jax.random.split(key)
+    # zeta = jax.random.uniform(subkey)
+    # walker_sr, weight_sr = wk.stochastic_reconfiguration(q, weights_new, zeta, wk_kind)
+
+    norms = wk.qr_norm(walkers_new, wk_kind)
     weights_new = state.weights * norms.real
     key, subkey = jax.random.split(key)
     zeta = jax.random.uniform(subkey)
-    walker_sr, weight_sr = wk.stochastic_reconfiguration(q, weights_new, zeta, wk_kind)
+
+    # Since we compute only R in the QR we need to divide
+    # by norms.real after the SR, requiering to keep track
+    # of the indices
+    idx = wk._sr_indices(weights_new, zeta, nw)
+    walker_sr, weight_sr = wk.stochastic_reconfiguration(walkers_new, weights_new, zeta, wk_kind)
+    norms = norms[idx]
+    weight_sr /= norms.real
 
     return PropState(
         walkers=walker_sr,

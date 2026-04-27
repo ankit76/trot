@@ -56,6 +56,7 @@ class QmcParamsLno(QmcParams):
 class QmcParamsFp(QmcParamsBase):
     dt: float = 0.05
     n_prop_steps: int = 20
+    n_qr_blocks: int = 10
     n_blocks: int = 5
     ene0: float | None = None
     n_traj: int = 10

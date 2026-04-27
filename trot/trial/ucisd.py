@@ -18,7 +18,8 @@ class UcisdTrial:
     determinant occupies the first nocc[0] alpha and nocc[1] beta orbitals.
 
     Arrays:
-      mo_coeff_b: (norb, nocc[1])
+      mo_a: (norb, nocc[0])
+      mo_b: (norb, nocc[1])
       c1a : (nocc[0], nvir[0])                      singles coefficients c_{i,alpha a,alpha}
       c1b : (nocc[1], nvir[1])                      singles coefficients c_{i,beta  a,beta }
       c2aa: (nocc[0], nvir[0], nocc[0], nvir[0])    doubles coefficients c_{i,alpha a,alpha j,alpha b,alpha}
@@ -26,8 +27,8 @@ class UcisdTrial:
       c2bb: (nocc[1], nvir[1], nocc[1], nvir[1])    doubles coefficients c_{i,beta  a,beta  j,beta  b,beta }
     """
 
-    mo_coeff_a: jax.Array
-    mo_coeff_b: jax.Array
+    mo_a: jax.Array
+    mo_b: jax.Array
     c1a: jax.Array
     c1b: jax.Array
     c2aa: jax.Array
@@ -36,7 +37,7 @@ class UcisdTrial:
 
     @property
     def norb(self) -> int:
-        return int(self.mo_coeff_b.shape[0])
+        return int(self.mo_b.shape[0])
 
     @property
     def nocc(self) -> tuple[int, int]:
@@ -48,8 +49,8 @@ class UcisdTrial:
 
     def tree_flatten(self):
         return (
-            self.mo_coeff_a,
-            self.mo_coeff_b,
+            self.mo_a,
+            self.mo_b,
             self.c1a,
             self.c1b,
             self.c2aa,
@@ -60,8 +61,8 @@ class UcisdTrial:
     @classmethod
     def tree_unflatten(cls, aux, children):
         (
-            mo_coeff_a,
-            mo_coeff_b,
+            mo_a,
+            mo_b,
             c1a,
             c1b,
             c2aa,
@@ -69,8 +70,8 @@ class UcisdTrial:
             c2bb,
         ) = children
         return cls(
-            mo_coeff_a=mo_coeff_a,
-            mo_coeff_b=mo_coeff_b,
+            mo_a=mo_a,
+            mo_b=mo_b,
             c1a=c1a,
             c1b=c1b,
             c2aa=c2aa,
@@ -87,7 +88,7 @@ def get_rdm1(trial_data: UcisdTrial) -> jax.Array:
     # UHF
     norb, (n_oa, n_ob) = trial_data.norb, trial_data.nocc
     occ_a = jnp.arange(norb) < n_oa
-    c_b = trial_data.mo_coeff_b
+    c_b = trial_data.mo_b
     dm_a = jnp.diag(occ_a)  # (norb, norb)
     dm_b = c_b[:, :n_ob] @ c_b[:, :n_ob].conj().T  # (norb, norb)
     return jnp.stack([dm_a, dm_b], axis=0)  # (2, norb, norb)
@@ -107,7 +108,7 @@ def overlap_u(walker: tuple[jax.Array, jax.Array], trial_data: UcisdTrial) -> ja
     c2aa = trial_data.c2aa
     c2ab = trial_data.c2ab
     c2bb = trial_data.c2bb
-    c_b = trial_data.mo_coeff_b
+    c_b = trial_data.mo_b
 
     wb = c_b.T @ wb[:, :n_ob]
     woa = wa[:n_oa, :]  # (n_oa, n_oa)
@@ -136,8 +137,8 @@ def overlap_g(walker: jax.Array, trial_data: UcisdTrial) -> jax.Array:
     c2aa = trial_data.c2aa
     c2ab = trial_data.c2ab
     c2bb = trial_data.c2bb
-    c_a = trial_data.mo_coeff_a
-    c_b = trial_data.mo_coeff_b
+    c_a = trial_data.mo_a
+    c_b = trial_data.mo_b
 
     _, ci1A, ci2AA = n_oa, c1a, c2aa
     noccB, ci1B, ci2BB = n_ob, c1b, c2bb
@@ -215,8 +216,8 @@ def make_ucisd_trial_ops(sys: System) -> TrialOps:
 
 def make_ucisd_trial_data(data: dict, sys: System) -> UcisdTrial:
     return UcisdTrial(
-        mo_coeff_a=jnp.asarray(data["mo_coeff_a"]),
-        mo_coeff_b=jnp.asarray(data["mo_coeff_b"]),
+        mo_a=jnp.asarray(data["mo_a"]),
+        mo_b=jnp.asarray(data["mo_b"]),
         c1a=jnp.asarray(data["ci1a"]),
         c1b=jnp.asarray(data["ci1b"]),
         c2aa=jnp.asarray(data["ci2aa"]),
