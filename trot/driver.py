@@ -864,7 +864,7 @@ def run_qmc_fp(
         print("Trajectory count", i + 1)
         print(f"{'tau':^12s}    " f"{'E_avg':^14s}  " f"{'E_err':^13s}  " f"{'sign':>6s}")
         if i > 0:
-            params = dataclasses.replace(params, seed=params.seed + i)
+            params = dataclasses.replace(params, seed=params.seed + 1)
             state = prop_ops.init_prop_state(
                 sys=sys,
                 ham_data=ham_data,
@@ -904,6 +904,7 @@ def run_qmc_fp(
         sign = jnp.sum(total_sign[: i + 1] * block_w_all[: i + 1], axis=0) / jnp.sum(
             block_w_all[: i + 1], axis=0
         )
+
         if i == 0:
             err = jnp.zeros_like(mean)
         else:
@@ -919,7 +920,7 @@ def run_qmc_fp(
             )
 
         # not implemented in free projection yet
-        block_obs_all: dict[str, jax.Array] = {}
+        block_obs_all: dict[str, jax.Array] = {"sign": total_sign}
         obs_means: dict[str, jax.Array] = {}
         obs_stderrs: dict[str, jax.Array] = {}
 
