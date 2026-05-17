@@ -10,8 +10,8 @@ from ..core.ops import MeasOps, TrialOps
 from ..core.system import System
 from ..ham.chol import HamChol
 from .afqmc import init_prop_state
-from .chol_afqmc_ops import TrotterOps, make_trotter_ops
-from .chol_afqmc_ops_fp import FpCholAfqmcCtx, _build_prop_ctx_fp
+from .chol_afqmc_ops import TrotterOps, CholAfqmcCtx
+from .chol_afqmc_ops_fp import _build_prop_ctx_fp, make_trotter_ops_fp
 from .types import PropOps, PropState, QmcParamsBase, QmcParamsFp
 
 
@@ -24,7 +24,7 @@ def afqmc_step_fp(
     trial_data: Any,
     meas_ops: MeasOps,
     trotter_ops: TrotterOps,
-    prop_ctx: FpCholAfqmcCtx,
+    prop_ctx: CholAfqmcCtx,
     meas_ctx: Any,
 ) -> PropState:
     key, subkey = jax.random.split(state.rng_key)
@@ -75,7 +75,7 @@ def afqmc_step_fp(
 def make_prop_ops_fp(
     ham_basis: str, walker_kind: str, sys: System, mixed_precision=False
 ) -> PropOps:
-    trotter_ops = make_trotter_ops(ham_basis, walker_kind, mixed_precision=mixed_precision)
+    trotter_ops = make_trotter_ops_fp(ham_basis, walker_kind, mixed_precision=mixed_precision)
 
     def step_fp(
         state: PropState,
@@ -100,7 +100,7 @@ def make_prop_ops_fp(
             trotter_ops=trotter_ops,
         )
 
-    def build_prop_ctx_fp(ham_data: Any, rdm1: jax.Array, params: QmcParamsBase) -> FpCholAfqmcCtx:
+    def build_prop_ctx_fp(ham_data: Any, rdm1: jax.Array, params: QmcParamsBase) -> CholAfqmcCtx:
         assert isinstance(params, QmcParamsFp)
         assert params.ene0 is not None, "ene0 must be set for FP propagation"
         return _build_prop_ctx_fp(

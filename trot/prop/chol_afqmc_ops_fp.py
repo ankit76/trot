@@ -1,50 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import jax
 import jax.numpy as jnp
-from jax import tree_util
 
 from ..ham.chol import HamChol
 from .chol_afqmc_ops import _build_exp_h1_half_from_h1, _get_h1_eff, _mf_shifts
-
-
-@tree_util.register_pytree_node_class
-@dataclass(frozen=True)
-class FpCholAfqmcCtx:
-    dt: jax.Array
-    sqrt_dt: jax.Array
-    exp_h1_half: jax.Array  # (n,n) or (ns,ns)
-    mf_shifts: jax.Array  # (n_fields,)
-    h0_prop: jax.Array  # scalar
-    chol_flat: jax.Array  # (n_fields, n*n)
-    norb: int
-
-    def tree_flatten(self):
-        return (
-            self.dt,
-            self.sqrt_dt,
-            self.exp_h1_half,
-            self.mf_shifts,
-            self.h0_prop,
-            self.chol_flat,
-        ), (self.norb,)
-
-    @classmethod
-    def tree_unflatten(cls, aux, children):
-        dt, sqrt_dt, exp_h1_half, mf_shifts, h0_prop, chol_flat = children
-        (norb,) = aux
-
-        return cls(
-            dt=dt,
-            sqrt_dt=sqrt_dt,
-            exp_h1_half=exp_h1_half,
-            mf_shifts=mf_shifts,
-            h0_prop=h0_prop,
-            chol_flat=chol_flat,
-            norb=norb,
-        )
+from .chol_afqmc_ops import TrotterOps, CholAfqmcCtx
+from .chol_afqmc_ops import _apply_trotter_r, _apply_trotter_u, _apply_trotter_g_from_restricted
 
 
 def _build_prop_ctx_fp(
@@ -53,7 +15,7 @@ def _build_prop_ctx_fp(
     dt: float,
     ene0: float = 0.0,
     chol_flat_precision: jnp.dtype = jnp.float64,
-) -> FpCholAfqmcCtx:
+) -> CholAfqmcCtx:
     dt_a = jnp.array(dt)
     sqrt_dt = jnp.sqrt(dt_a)
     mf = _mf_shifts(ham_data, rdm1)
@@ -63,7 +25,7 @@ def _build_prop_ctx_fp(
     exp_h1_half = _build_exp_h1_half_from_h1(h1_eff, dt_a)
     chol_flat = ham_data.chol.reshape(ham_data.chol.shape[0], -1).astype(chol_flat_precision)
     norb = ham_data.chol.shape[1]
-    return FpCholAfqmcCtx(
+    return CholAfqmcCtx(
         dt=dt_a,
         sqrt_dt=sqrt_dt,
         exp_h1_half=exp_h1_half,
@@ -72,3 +34,63 @@ def _build_prop_ctx_fp(
         chol_flat=chol_flat,
         norb=norb,
     )
+
+
+def _make_vhs_split_flat_fp(*, chol_flat: jax.Array, x: jax.Array, n: int) -> jax.Array:
+    # chol_flat: (n_fields, n*n) real
+    v = x @ chol_flat  # (n*n,)
+    return v.reshape(n, n)
+
+
+def make_trotter_ops_fp(
+    ham_basis: str, walker_kind: str, mixed_precision: bool = False
+) -> TrotterOps:
+    assert isinstance(ham_basis, str)
+    assert isinstance(walker_kind, str)
+    assert isinstance(mixed_precision, bool)
+
+    walker_kind = walker_kind.lower()
+
+    if mixed_precision:
+        vhs_real_dtype = jnp.float32
+    else:
+        vhs_real_dtype = jnp.float64
+
+    def make_vhs(field: jax.Array, ctx: CholAfqmcCtx) -> jax.Array:
+        return _make_vhs_split_flat_fp(
+            chol_flat=ctx.chol_flat,
+            x=field.astype(vhs_real_dtype),
+            n=ctx.norb,
+        )
+
+    if walker_kind not in ("restricted", "unrestricted", "generalized"):
+        raise ValueError(f"unknown walker_kind: {walker_kind}")
+
+    if ham_basis not in ("restricted", "generalized"):
+        raise ValueError(f"unknown ham_basis: {ham_basis}")
+
+    match ham_basis, walker_kind:
+        case "restricted", "restricted":
+            apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs: _apply_trotter_r(
+                w, f, ctx, n_terms, make_vhs=mv
+            )
+        case "restricted", "unrestricted":
+            apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs: _apply_trotter_u(
+                w, f, ctx, n_terms, make_vhs=mv
+            )
+        case "restricted", "generalized":
+            apply_trotter = (
+                lambda w, f, ctx, n_terms, mv=make_vhs: _apply_trotter_g_from_restricted(
+                    w, f, ctx, n_terms, make_vhs=mv
+                )
+            )
+        case "generalized", "generalized":
+            apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs: _apply_trotter_r(
+                w, f, ctx, n_terms, make_vhs=mv
+            )
+        case _:
+            raise NotImplementedError(
+                f"Not implemented for ham_basis={ham_basis} and walker_kind={walker_kind}"
+            )
+
+    return TrotterOps(apply_trotter)
