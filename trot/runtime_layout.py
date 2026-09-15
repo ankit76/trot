@@ -13,6 +13,7 @@ from jax.sharding import Mesh
 from .core.ops import MeasOps, TrialOps, k_energy
 from .core.system import System
 from .ham.chol import HamChol
+from .ham.chol_u import HamCholU
 from .meas.cisd import CisdMeasCfg, CisdMeasCtx, get_cisd_meas_cfg
 from .meas.rhf import RhfMeasCfg, RhfMeasCtx, get_rhf_meas_cfg
 from .prop.chol_afqmc_ops import CholAfqmcCtx
@@ -59,7 +60,7 @@ class RuntimeJob(Protocol):
 
 
 class RuntimeLayout(Protocol):
-    def make_initial_ham_data(self, ham: HamInput | HamChol, mesh: Mesh | None) -> HamChol: ...
+    def make_initial_ham_data(self, ham: Any, mesh: Mesh | None) -> HamChol | HamCholU: ...
 
     def prepare(
         self,
@@ -84,6 +85,29 @@ def _padded_model_length(length: int, mesh: Mesh | None) -> int:
     if remainder == 0:
         return length
     return length + (n_model - remainder)
+
+
+def _make_ham_data_uh(ham: Any, mesh: Mesh | None) -> HamCholU:
+    """
+    Runtime HamCholU. chol_a and chol_b share the auxiliary field axis, so if they are
+    ever sharded they must be padded identically; multi GPU is not wired for this path
+    yet, so a mesh with a model axis is refused rather than silently mis-sharded.
+    """
+    if isinstance(ham, HamCholU):
+        return ham
+    if has_model_axis(mesh):
+        raise NotImplementedError(
+            "model-axis sharding is not implemented for the unrestricted (uchol) "
+            "hamiltonian yet; use mesh=None or a data-only mesh."
+        )
+    return HamCholU(
+        h0=jnp.asarray(ham.h0),
+        h1_a=jnp.asarray(ham.h1_a),
+        h1_b=jnp.asarray(ham.h1_b),
+        chol_a=jnp.asarray(ham.chol_a),
+        chol_b=jnp.asarray(ham.chol_b),
+        basis="uchol",
+    )
 
 
 def _make_ham_data(ham: HamInput | HamChol, mesh: Mesh | None, *, compact_chol: bool) -> HamChol:
@@ -361,7 +385,9 @@ def _compact_ham_data_for_runtime(ham_data: Any, meas_ctx: Any) -> Any:
 
 @dataclass(frozen=True)
 class DefaultRuntimeLayout:
-    def make_initial_ham_data(self, ham: HamInput | HamChol, mesh: Mesh | None) -> HamChol:
+    def make_initial_ham_data(self, ham: Any, mesh: Mesh | None) -> HamChol | HamCholU:
+        if isinstance(ham, HamCholU) or getattr(ham, "basis", None) == "uchol":
+            return _make_ham_data_uh(ham, mesh)
         return _make_ham_data(ham, mesh, compact_chol=False)
 
     def prepare(

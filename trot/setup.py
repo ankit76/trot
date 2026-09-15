@@ -15,9 +15,9 @@ print = partial(print, flush=True)
 from . import driver
 from .driver import QmcResult
 from .core.ops import MeasOps, TrialOps
-from .core.system import System, WalkerKind
+from .core.system import System, System_uh, WalkerKind
 from .ham.chol import HamChol
-from .prop.afqmc import make_prop_ops
+from .prop.afqmc import make_prop_ops, make_prop_ops_u
 from .prop.blocks import block as default_block
 from .prop.types import PropOps, PropState, QmcParams, QmcParamsBase
 from .runtime_layout import RuntimeLayout, make_runtime_layout
@@ -105,6 +105,12 @@ def _make_prop(
     *,
     mixed_precision: bool,
 ) -> Any:
+    if ham_data.basis == "uchol":
+        return make_prop_ops_u(
+            ham_data.basis,
+            walker_kind,
+            mixed_precision=mixed_precision,
+        )
     return make_prop_ops(
         ham_data.basis,
         walker_kind,
@@ -157,6 +163,16 @@ def _make_trial_bundle(
 
     kind = tr.kind.lower()
     t_bundle = _setup_begin(f"building trial bundle ({kind})")
+
+    if getattr(staged.ham, "basis", None) == "uchol":
+        from .meas.uhf import make_uhf_meas_ops_uh
+        from .trial.uhf import make_uhf_trial_data_uh, make_uhf_trial_ops_uh
+
+        trial_data = make_uhf_trial_data_uh(sys)
+        trial_ops = make_uhf_trial_ops_uh(sys)
+        meas_ops = make_uhf_meas_ops_uh(sys)
+        _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind} (uchol)")
+        return trial_data, trial_ops, meas_ops
 
     if kind == "rhf":
         from .meas.rhf import make_rhf_meas_ops
@@ -244,6 +260,8 @@ def _make_trial_bundle(
 
 
 def _resolve_default_walker_kind(ham: Any, walker_kind: WalkerKind | None) -> WalkerKind:
+    if getattr(ham, "basis", None) == "uchol":
+        return cast(WalkerKind, "unrestricted")
     if walker_kind is None:
         return cast(WalkerKind, ham.basis)
     return walker_kind
@@ -379,12 +397,16 @@ def _assemble_job(
     ham = staged.ham
 
     resolved_walker_kind = walker_kind_resolver(ham, walker_kind)
-    sys = System(norb=int(ham.norb), nelec=ham.nelec, walker_kind=resolved_walker_kind)
+    sys: System | System_uh
+    if getattr(ham, "basis", None) == "uchol":
+        sys = System_uh(norb=cast(tuple, ham.norb), nelec=ham.nelec)
+    else:
+        sys = System(norb=int(ham.norb), nelec=ham.nelec, walker_kind=resolved_walker_kind)
 
     qmc_params = params_builder(params=params, **(params_kwargs or {}))
 
     if trial_data is None or trial_ops is None or meas_ops is None:
-        td, to, mo = _make_trial_bundle(sys, staged, mixed_precision)
+        td, to, mo = _make_trial_bundle(cast(System, sys), staged, mixed_precision)
         trial_data = td if trial_data is None else trial_data
         trial_ops = to if trial_ops is None else trial_ops
         meas_ops = mo if meas_ops is None else meas_ops
@@ -416,9 +438,9 @@ def _assemble_job(
 
     return job_cls(
         staged=staged,
-        sys=sys,
+        sys=cast(System, sys),
         params=qmc_params,
-        ham_data=ham_data,
+        ham_data=cast(HamChol, ham_data),
         trial_data=trial_data,
         trial_ops=trial_ops,
         meas_ops=meas_ops,

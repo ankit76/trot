@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax import tree_util
+from jax import lax, tree_util
 
 from ..core.ops import MeasOps, k_energy, k_force_bias, o_density_corr, o_rdm1
 from ..core.system import System
 from ..ham.chol import HamChol
+from ..ham.chol_u import HamCholU
 from ..trial.uhf import UhfTrial, overlap_g, overlap_r, overlap_u
 
 
@@ -274,6 +276,132 @@ def energy_kernel_gw_rh(
     return e0 + e1 + (J - K) / 2.0
 
 
+# unrestricted walker + unrestricted (uchol) hamiltonian.
+#
+# u_rot_force_bias and u_rot_energy are ported from afqmc/slater_tools.py; the kernels
+# below are the trot facing wrappers, matching what afqmc/wavefunctions/uhf_wfn.py does
+# in rot_force_bias / rot_energy (the wrapper chunks rot_chol, slater_tools consumes it).
+#
+# afqmc's u_half_green is NOT copied: trot's _half_green_from_overlap_matrix already
+# computes the same thing, since solve(m.T, w.T) == (w @ inv(m)).T with m = C^H w.
+#
+# Only the half rotated forms are carried over, since trot always half rotates.
+
+DEFAULT_NCHOL_CHUNK: int | None = None
+
+
+def _u_half_green(bra: tuple, ket: tuple) -> tuple[jax.Array, jax.Array]:
+    """Half green's function per spin, (nocc_sigma, norb_sigma)."""
+    ga = _half_green_from_overlap_matrix(ket[0], bra[0].conj().T @ ket[0])
+    gb = _half_green_from_overlap_matrix(ket[1], bra[1].conj().T @ ket[1])
+    return (ga, gb)
+
+
+def u_rot_force_bias(bra: tuple, ket: tuple, rot_chol: tuple) -> jax.Array:
+    """
+    Force bias against an unrestricted half rotated hamiltonian.
+
+    rot_chol is (rot_chol_a, rot_chol_b), each (n_chol, nocc_sigma, norb_sigma). The two
+    spins share only the field axis, so norb_a and norb_b may differ. Returns one length
+    n_chol vector, summed over spin.
+    """
+    green = _u_half_green(bra, ket)
+    fb_a = jnp.einsum("gij,ij->g", rot_chol[0], green[0], optimize="optimal")
+    fb_b = jnp.einsum("gij,ij->g", rot_chol[1], green[1], optimize="optimal")
+    return fb_a + fb_b
+
+
+def u_rot_energy(
+    bra: tuple,
+    ket: tuple,
+    h0: jax.Array,
+    rot_h1: tuple,
+    rot_chol: tuple,
+) -> jax.Array:
+    """
+    Energy against a spin unrestricted half rotated hamiltonian.
+
+    rot_chol_a and rot_chol_b are expected as (n_chunks, nchol_chunk, nocc, norb); a
+    plain (n_chol, nocc, norb) is accepted and treated as a single chunk. The two body
+    term is reduced with lax.scan over chunks, so peak memory is set by the chunk size
+    rather than by n_chol.
+    """
+    chol_a, chol_b = rot_chol
+    if chol_a.ndim == 3:
+        chol_a = chol_a.reshape(1, *chol_a.shape)
+    if chol_b.ndim == 3:
+        chol_b = chol_b.reshape(1, *chol_b.shape)
+
+    green = _u_half_green(bra, ket)
+    e1 = jnp.einsum("pq,pq->", rot_h1[0], green[0], optimize="optimal") + jnp.einsum(
+        "pq,pq->", rot_h1[1], green[1], optimize="optimal"
+    )
+
+    zero = jnp.array(0.0, dtype=jnp.result_type(chol_a, green[0], green[1]))
+
+    def scanned_fun(carry: jax.Array, x) -> tuple[jax.Array, None]:
+        chol_a_c, chol_b_c = x  # (nchol_chunk, nocc_sigma, norb_sigma) each
+        lg_a_c = jnp.einsum("gpr,qr->gpq", chol_a_c, green[0], optimize="optimal")
+        lg_b_c = jnp.einsum("gpr,qr->gpq", chol_b_c, green[1], optimize="optimal")
+        trlg_a_c = jnp.einsum("gpp->g", lg_a_c, optimize="optimal")
+        trlg_b_c = jnp.einsum("gpp->g", lg_b_c, optimize="optimal")
+
+        e2aa_c = jnp.sum(trlg_a_c**2) - jnp.einsum("gpq,gqp->", lg_a_c, lg_a_c, optimize="optimal")
+        e2ab_c = jnp.sum(trlg_a_c * trlg_b_c) * 2
+        e2bb_c = jnp.sum(trlg_b_c**2) - jnp.einsum("gpq,gqp->", lg_b_c, lg_b_c, optimize="optimal")
+
+        carry += (e2aa_c + e2ab_c + e2bb_c) / 2
+        return carry, None
+
+    e2, _ = lax.scan(scanned_fun, zero, (chol_a, chol_b))
+
+    return h0 + e1 + e2
+
+
+def _chunk_rot_chol(rot_chol: jax.Array, nchol_chunk: int | None) -> jax.Array:
+    """(n_chol, nocc, norb) -> (n_chunks, nchol_chunk, nocc, norb), zero padded."""
+    n_chol = int(rot_chol.shape[0])
+    chunk = n_chol if nchol_chunk is None else int(nchol_chunk)
+    chunk = max(1, min(chunk, n_chol))
+    n_chunks = -(-n_chol // chunk)
+    pad = n_chunks * chunk - n_chol
+    if pad:
+        rot_chol = jnp.pad(rot_chol, ((0, pad), (0, 0), (0, 0)))
+    return rot_chol.reshape(n_chunks, chunk, *rot_chol.shape[1:])
+
+
+def force_bias_kernel_uw_uh(
+    walker: tuple[jax.Array, jax.Array],
+    ham_data: HamCholU,
+    meas_ctx: UhfMeasCtx,
+    trial_data: UhfTrial,
+) -> jax.Array:
+    bra = (trial_data.mo_coeff_a, trial_data.mo_coeff_b)
+    return u_rot_force_bias(bra, walker, (meas_ctx.rot_chol_a, meas_ctx.rot_chol_b))
+
+
+def energy_kernel_uw_uh(
+    walker: tuple[jax.Array, jax.Array],
+    ham_data: HamCholU,
+    meas_ctx: UhfMeasCtx,
+    trial_data: UhfTrial,
+    *,
+    nchol_chunk: int | None = DEFAULT_NCHOL_CHUNK,
+) -> jax.Array:
+    bra = (trial_data.mo_coeff_a, trial_data.mo_coeff_b)
+    rot_chol = (
+        _chunk_rot_chol(meas_ctx.rot_chol_a, nchol_chunk),
+        _chunk_rot_chol(meas_ctx.rot_chol_b, nchol_chunk),
+    )
+    return u_rot_energy(
+        bra,
+        walker,
+        ham_data.h0,
+        (meas_ctx.rot_h1_a, meas_ctx.rot_h1_b),
+        rot_chol,
+    )
+
+
 @tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class UhfMeasCtx:
@@ -336,6 +464,36 @@ def build_meas_ctx(ham_data: HamChol, trial_data: UhfTrial) -> UhfMeasCtx:
     )
 
 
+def build_meas_ctx_uh(ham_data: HamCholU, trial_data: UhfTrial) -> UhfMeasCtx:
+    """
+    Build half rotated h1 and chol for unrestricted hamiltonian,
+    where alpha and beta may live in different orbital spaces.
+
+    Same UhfMeasCtx as build_meas_ctx, which already keeps the two spins separate. The
+    only change is the source: each spin is rotated with its own h1 and cholesky vectors
+    rather than with one shared set. The resulting rot_chol_a and rot_chol_b share the
+    field axis but not the orbital axis.
+    """
+    if ham_data.basis != "uchol":
+        raise ValueError("UHF unrestricted MeasOps assumes HamCholU.basis == 'uchol'.")
+    caH = trial_data.mo_coeff_a.conj().T  # (nocc[0], norb_a)
+    cbH = trial_data.mo_coeff_b.conj().T  # (nocc[1], norb_b)
+    rot_h1_a = caH @ ham_data.h1_a  # (nocc[0], norb_a)
+    rot_h1_b = cbH @ ham_data.h1_b  # (nocc[1], norb_b)
+    rot_chol_a = jnp.einsum("ip,gpq->giq", caH, ham_data.chol_a, optimize="optimal")
+    rot_chol_b = jnp.einsum("ip,gpq->giq", cbH, ham_data.chol_b, optimize="optimal")
+    rot_chol_flat_a = rot_chol_a.reshape(rot_chol_a.shape[0], -1)
+    rot_chol_flat_b = rot_chol_b.reshape(rot_chol_b.shape[0], -1)
+    return UhfMeasCtx(
+        rot_h1_a=rot_h1_a,
+        rot_h1_b=rot_h1_b,
+        rot_chol_a=rot_chol_a,
+        rot_chol_b=rot_chol_b,
+        rot_chol_flat_a=rot_chol_flat_a,
+        rot_chol_flat_b=rot_chol_flat_b,
+    )
+
+
 def make_uhf_meas_ops(sys: System) -> MeasOps:
     wk = sys.walker_kind.lower()
     if wk == "restricted":
@@ -376,4 +534,30 @@ def make_uhf_meas_ops(sys: System) -> MeasOps:
         build_meas_ctx=build_meas_ctx_fn,
         kernels=kernels,
         observables=observables,
+    )
+
+
+def make_uhf_meas_ops_uh(sys: Any, *, nchol_chunk: int | None = DEFAULT_NCHOL_CHUNK) -> MeasOps:
+    """
+    MeasOps for an unrestricted (uchol) hamiltonian.
+
+    Only the unrestricted walker kind is meaningful here: alpha and beta live in
+    different orbital spaces, so a shared or spin blocked walker cannot represent them.
+
+    No observables are wired: rdm1_kernel_uw and density_corr_kernel_uw stack the two
+    spin blocks and so do not survive norb_a != norb_b.
+    """
+    wk = sys.walker_kind.lower()
+    if wk != "unrestricted":
+        raise ValueError(
+            f"the unrestricted hamiltonian path requires walker_kind='unrestricted', got {wk!r}"
+        )
+
+    energy_kernel = partial(energy_kernel_uw_uh, nchol_chunk=nchol_chunk)
+
+    return MeasOps(
+        overlap=overlap_u,
+        build_meas_ctx=build_meas_ctx_uh,
+        kernels={k_force_bias: force_bias_kernel_uw_uh, k_energy: energy_kernel},
+        observables={},
     )

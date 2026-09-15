@@ -1273,6 +1273,20 @@ def _stage_gcisd_input(obj: StagedMfOrCc) -> TrialInput:
     )
 
 
+def stage_pt2ccsd_trial(cc: Any, *, frozen: int | ArrayLike | None = None) -> TrialInput:
+    """
+    Stage a pt2CCSD trial from a pyscf CC object.
+
+    A CCSD object is ambiguous: it can serve as a CISD trial (what stage() builds) or as
+    a pt2CCSD trial. Type dispatch cannot tell those apart, so this is a separate entry
+    point rather than another case in _stage_trial_input.
+
+    Returns a TrialInput with data {"mo_t", "t2"}: mo_t is the Thouless-transformed
+    reference exp(T1)|HF> in the MO basis, t2 the doubles amplitudes as (i, a, j, b).
+    """
+    return _stage_pt2ccsd_input(StagedMfOrCc(cc, frozen))
+
+
 def _stage_pt2ccsd_input(obj):
     # TODO obj.kind is frozen... figure out how to assign more flexible trial
     # if obj.kind != "pt2ccsd":
@@ -1304,6 +1318,59 @@ def _stage_pt2ccsd_input(obj):
     data = {"mo_t": mo_t, "t2": t2}
     return TrialInput(
         kind="pt2ccsd",
+        data=data,
+        frozen=obj.trial_frozen,
+        source_kind=obj.source,
+    )
+
+
+def stage_upt2ccsd_trial(cc: Any, *, frozen: int | ArrayLike | None = None) -> TrialInput:
+    """
+    Stage an unrestricted pt2CCSD trial from a pyscf UCCSD object, in the conventions of
+    afqmc's upt2ccsd trials (integral.save_cc_amplitude, slater_tools.uthouless).
+
+    Each spin is expressed in its own MO basis -- the basis build_ham_uchol builds that
+    spin's hamiltonian in -- so its reference occupies the leading nocc orbitals.
+
+    Returns a TrialInput with data {"mo_t_a", "mo_t_b", "t2aa", "t2ab", "t2bb"}: mo_t_s is
+    the Thouless-transformed reference exp(T1s)|HF_s>, and the doubles are (i, a, j, b)
+    with the same spin blocks antisymmetrized.
+    """
+    return _stage_upt2ccsd_input(StagedMfOrCc(cc, frozen))
+
+
+def _stage_upt2ccsd_input(obj: StagedMfOrCc) -> TrialInput:
+    if obj.kind != "uccsd":
+        raise ValueError(f"unrestricted pt2CCSD needs a UCCSD object, got kind {obj.kind!r}.")
+
+    t1a, t1b = (np.asarray(t) for t in obj.t1)
+    t2aa, t2ab, t2bb = (np.asarray(t) for t in obj.t2)
+
+    # antisymmetrize the same spin blocks (a no-op on pyscf's, which already are), then
+    # (i,j,a,b) -> (i,a,j,b)
+    t2aa = 0.5 * (t2aa - t2aa.transpose(0, 1, 3, 2))
+    t2bb = 0.5 * (t2bb - t2bb.transpose(0, 1, 3, 2))
+    t2aa = t2aa.transpose(0, 2, 1, 3)
+    t2ab = t2ab.transpose(0, 2, 1, 3)
+    t2bb = t2bb.transpose(0, 2, 1, 3)
+
+    def _thouless(t1):
+        # |psi'> = exp(t1_ia a+ i)|psi>, with |psi> the leading nocc orbitals of the MO
+        # basis; returns the mo_coeff of psi' in that basis
+        nocc, nvir = t1.shape
+        exp_t1 = np.eye(nocc + nvir, dtype=np.float64)
+        exp_t1[:nocc, nocc:] = t1
+        return exp_t1.T[:, :nocc]
+
+    data = {
+        "mo_t_a": _thouless(t1a),
+        "mo_t_b": _thouless(t1b),
+        "t2aa": t2aa,
+        "t2ab": t2ab,
+        "t2bb": t2bb,
+    }
+    return TrialInput(
+        kind="upt2ccsd",
         data=data,
         frozen=obj.trial_frozen,
         source_kind=obj.source,
@@ -1464,3 +1531,302 @@ def build_ham_lno(
     )
 
     return ham
+
+
+# ======================================================================================
+# unrestricted (uchol) hamiltonian
+#
+# alpha and beta keep their own orbital basis, so h1 and chol are carried per spin. One
+# common set of AO cholesky vectors is projected into each basis,
+#
+#     L^sigma_g = C_sigma^T L_g C_sigma,
+#
+# which keeps the auxiliary field index g shared while the orbital indices are per spin,
+# and lets norb_a differ from norb_b.
+# ======================================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class HamInputU:
+    """Unrestricted ham inputs, each spin in its own orthonormal one particle basis."""
+
+    h0: float
+    h1_a: Array  # (norb_a, norb_a)
+    h1_b: Array  # (norb_b, norb_b)
+    chol_a: Array  # (nchol, norb_a, norb_a)
+    chol_b: Array  # (nchol, norb_b, norb_b)
+    nelec: Tuple[int, int]
+    norb: Tuple[int, int]
+    chol_cut: float
+    frozen: int | NDArray
+    source_kind: str  # "mf" or "cc"
+    basis: str = "uchol"
+
+
+def df2chol(dferi: NDArray, max_error: float = 1e-6) -> NDArray:
+    """
+    Modified cholesky decomposition of a density fitting tensor.
+
+    Args:
+        dferi: packed 3-index DF integrals, shape (n_aux, n_pair) with n_pair the lower
+            triangle of the AO pair index (pyscf lib.pack_tril ordering).
+        max_error: stop when the residual diagonal falls below this.
+
+    Returns:
+        (n_chol, norb, norb) cholesky vectors.
+    """
+    dferi = np.asarray(dferi)
+    n_aux, n_pair = dferi.shape
+    norb = int(round((-1 + (1 + 8 * n_pair) ** 0.5) / 2))
+    if norb * (norb + 1) // 2 != n_pair:
+        raise ValueError(f"n_pair={n_pair} is not a valid packed lower triangle size")
+
+    diag = (dferi**2).sum(axis=0)
+    chol_vecs = np.zeros((n_aux, n_pair))
+    m_approx = np.zeros(n_pair)
+    diag_residual = diag.copy()
+
+    nchol = 0
+    while nchol < n_aux:
+        nu = int(np.argmax(diag_residual))
+        delta_max = diag_residual[nu]
+        if delta_max < max_error:
+            break
+
+        row_nu = dferi.T @ dferi[:, nu]
+        if nchol == 0:
+            chol_vecs[nchol] = row_nu / delta_max**0.5
+        else:
+            r = chol_vecs[:nchol, nu] @ chol_vecs[:nchol, :]
+            chol_vecs[nchol] = (row_nu - r) / delta_max**0.5
+
+        m_approx += chol_vecs[nchol] ** 2
+        diag_residual = np.abs(diag - m_approx)
+        nchol += 1
+
+    chol = np.zeros((nchol, norb, norb))
+    row_idx, col_idx = np.tril_indices(norb)
+    chol[:, row_idx, col_idx] = chol_vecs[:nchol]
+    chol[:, col_idx, row_idx] = chol_vecs[:nchol]
+    return chol
+
+
+def _df_cderi(mf: Any) -> NDArray | None:
+    """Packed (n_aux, n_pair) DF tensor if this mean field is density fitted, else None."""
+    with_df = getattr(mf, "with_df", None)
+    if with_df is None:
+        return None
+    blocks = [np.asarray(b) for b in with_df.loop()]
+    if not blocks:
+        return None
+    return np.vstack(blocks)
+
+
+def ao_cholesky(mf: Any, mol: Any, *, chol_cut: float, verbose: bool = False) -> NDArray:
+    """
+    AO cholesky vectors, flattened to (n_chol, nao*nao).
+
+    Uses the density fitting tensor when the mean field carries one, otherwise falls back
+    to the modified cholesky decomposition of the AO ERIs.
+    """
+    t0 = time.time()
+    cderi = _df_cderi(mf)
+
+    if cderi is not None:
+        print(
+            f"[stage] cholesky from density fitting (n_aux={cderi.shape[0]}), "
+            f"max_error={chol_cut:g} ..."
+        )
+        chol = df2chol(cderi, max_error=chol_cut)
+        nao = int(chol.shape[1])
+        chol = chol.reshape(chol.shape[0], nao * nao)
+        source = "density fitting"
+    else:
+        print(f"[stage] AO modified cholesky, max_error={chol_cut:g} ...")
+        chol = np.asarray(chunked_cholesky(mol, max_error=chol_cut, verbose=verbose))
+        source = "AO modified cholesky"
+
+    print(f"[stage] {source}: nchol={chol.shape[0]} in {time.time() - t0:.2f}s")
+    return chol
+
+
+def _freeze_core_from_mo_cholesky_uh(
+    *,
+    h0: float,
+    h1_a: NDArray,
+    h1_b: NDArray,
+    chol_a: NDArray,
+    chol_b: NDArray,
+    norb_frozen: int,
+    nelec: Tuple[int, int],
+) -> tuple[float, NDArray, NDArray, NDArray, NDArray, Tuple[int, int]]:
+    """
+    Unrestricted frozen core.
+
+    _freeze_core_from_mo_cholesky is closed shell: it carries factors of 2 that assume
+    both spins occupy the same spatial core orbitals. Here the two spins have their own
+    basis and their own core, so:
+
+        E_core   = sum_sigma tr h^sigma_cc
+                   + 1/2 sum_g [ T_g^2 - sum_sigma tr(L^sigma_cc L^sigma_cc) ]
+        h1_eff^s = h^s_aa + sum_g T_g L^s_aa - sum_g L^s_ac L^s_ca
+
+    with T_g = tr L^a_g,cc + tr L^b_g,cc the core trace summed over spin. The coulomb
+    term sees both spins (T_g), the exchange term only its own.
+
+    Setting alpha == beta reduces to the restricted expressions.
+    """
+    if norb_frozen < 0:
+        raise ValueError(f"norb_frozen must be non-negative, got {norb_frozen}.")
+    if norb_frozen == 0:
+        return float(h0), h1_a, h1_b, chol_a, chol_b, nelec
+    if norb_frozen > min(nelec):
+        raise ValueError(f"norb_frozen={norb_frozen} exceeds min(nelec)={min(nelec)}")
+
+    nmo_a, nmo_b = int(h1_a.shape[0]), int(h1_b.shape[0])
+    if norb_frozen >= min(nmo_a, nmo_b):
+        raise ValueError(
+            f"norb_frozen={norb_frozen} leaves no active orbitals "
+            f"(norb_a={nmo_a}, norb_b={nmo_b})."
+        )
+
+    nelec_active = (int(nelec[0] - norb_frozen), int(nelec[1] - norb_frozen))
+    if min(nelec_active) < 0 or sum(nelec_active) <= 0:
+        raise ValueError("Frozen core left no active electrons.")
+
+    core = slice(0, norb_frozen)
+
+    def blocks(h1, chol, nmo):
+        act = slice(norb_frozen, nmo)
+        return (
+            np.asarray(h1[core, core]),
+            np.asarray(h1[act, act]),
+            np.asarray(chol[:, core, core]),
+            np.asarray(chol[:, act, act]),
+            np.asarray(chol[:, act, core]),
+            np.asarray(chol[:, core, act]),
+        )
+
+    h1_cc_a, h1_aa_a, l_cc_a, l_aa_a, l_ac_a, l_ca_a = blocks(h1_a, chol_a, nmo_a)
+    h1_cc_b, h1_aa_b, l_cc_b, l_aa_b, l_ac_b, l_ca_b = blocks(h1_b, chol_b, nmo_b)
+
+    # core trace summed over spin: the coulomb field the active space sees
+    t_g = np.trace(l_cc_a, axis1=1, axis2=2) + np.trace(l_cc_b, axis1=1, axis2=2)
+
+    vj_a = np.einsum("x,xpq->pq", t_g, l_aa_a, optimize=True)
+    vj_b = np.einsum("x,xpq->pq", t_g, l_aa_b, optimize=True)
+    vk_a = np.einsum("xpi,xiq->pq", l_ac_a, l_ca_a, optimize=True)
+    vk_b = np.einsum("xpi,xiq->pq", l_ac_b, l_ca_b, optimize=True)
+
+    h1_eff_a = h1_aa_a + vj_a - vk_a
+    h1_eff_b = h1_aa_b + vj_b - vk_b
+
+    e1_core = np.trace(h1_cc_a) + np.trace(h1_cc_b)
+    ej_core = 0.5 * float(np.dot(t_g, t_g))
+    ek_core = 0.5 * (
+        np.einsum("xij,xji->", l_cc_a, l_cc_a, optimize=True)
+        + np.einsum("xij,xji->", l_cc_b, l_cc_b, optimize=True)
+    )
+    ecore = float(np.real(h0 + e1_core + ej_core - ek_core))
+
+    return (
+        ecore,
+        np.asarray(h1_eff_a),
+        np.asarray(h1_eff_b),
+        np.array(l_aa_a, copy=True),
+        np.array(l_aa_b, copy=True),
+        nelec_active,
+    )
+
+
+def build_ham_uchol(
+    obj: Any,
+    *,
+    chol_cut: float = 1e-5,
+    basis_a: NDArray | None = None,
+    basis_b: NDArray | None = None,
+    norb_frozen_core: int = 0,
+    verbose: bool = False,
+) -> HamInputU:
+    """
+    Build an unrestricted cholesky hamiltonian from a pyscf UHF (or CC) object.
+
+    basis_a / basis_b default to the UHF alpha and beta coefficients. Pass them
+    explicitly to use two independently chosen active spaces, which is what unrestricted
+    LNO does and where norb_a != norb_b comes from.
+    """
+    staged = StagedMfOrCc(obj, norb_frozen_core)
+    mf = staged.mf.mf
+    mol = mf.mol
+
+    if basis_a is None or basis_b is None:
+        mo = staged.mo_coeff
+        # pyscf gives UHF coefficients either as a (2, nao, nmo) array or as a pair
+        if not isinstance(mo, (tuple, list)):
+            mo_arr = np.asarray(mo)
+            if mo_arr.ndim != 3 or mo_arr.shape[0] != 2:
+                raise ValueError(
+                    "build_ham_uchol needs a UHF-like object with (mo_a, mo_b) "
+                    "coefficients, or explicit basis_a / basis_b."
+                )
+            mo = (mo_arr[0], mo_arr[1])
+        elif len(mo) != 2:
+            raise ValueError(
+                "build_ham_uchol needs a UHF-like object with (mo_a, mo_b) coefficients, "
+                "or explicit basis_a / basis_b."
+            )
+        basis_a = np.asarray(mo[0]) if basis_a is None else np.asarray(basis_a)
+        basis_b = np.asarray(mo[1]) if basis_b is None else np.asarray(basis_b)
+    basis_a = np.asarray(basis_a)
+    basis_b = np.asarray(basis_b)
+
+    h0 = float(mf.energy_nuc())
+    hcore = np.asarray(mf.get_hcore())
+    chol_ao = ao_cholesky(mf, mol, chol_cut=chol_cut, verbose=verbose)
+
+    t_proj = time.time()
+    h1_a = basis_a.conj().T @ hcore @ basis_a
+    h1_b = basis_b.conj().T @ hcore @ basis_b
+    # _rotate_chol_to_mo rotates in place when nao == norb, so the alpha call would
+    # otherwise clobber chol_ao and the beta call would rotate it a second time. Hand
+    # alpha a copy and let beta consume the original (its last use).
+    chol_a = _rotate_chol_to_mo(np.array(chol_ao, copy=True), basis_a)
+    chol_b = _rotate_chol_to_mo(chol_ao, basis_b)
+    print(
+        f"[stage] projected chol into the alpha/beta bases "
+        f"({basis_a.shape[1]}, {basis_b.shape[1]} orbitals) in {time.time() - t_proj:.2f}s"
+    )
+
+    nelec: Tuple[int, int] = (int(mol.nelec[0]), int(mol.nelec[1]))
+
+    norb_frozen = int(norb_frozen_core)
+    if norb_frozen > 0:
+        h0, h1_a, h1_b, chol_a, chol_b, nelec = _freeze_core_from_mo_cholesky_uh(
+            h0=h0,
+            h1_a=h1_a,
+            h1_b=h1_b,
+            chol_a=chol_a,
+            chol_b=chol_b,
+            norb_frozen=norb_frozen,
+            nelec=nelec,
+        )
+
+    norb = (int(h1_a.shape[0]), int(h1_b.shape[0]))
+    print(
+        f"[stage] uchol ham ready: norb={norb} nchol={chol_a.shape[0]} "
+        f"nelec={nelec} frozen={norb_frozen} h0={h0:.10f}"
+    )
+
+    return HamInputU(
+        h0=h0,
+        h1_a=np.asarray(h1_a),
+        h1_b=np.asarray(h1_b),
+        chol_a=np.asarray(chol_a),
+        chol_b=np.asarray(chol_b),
+        nelec=nelec,
+        norb=norb,
+        chol_cut=float(chol_cut),
+        frozen=norb_frozen,
+        source_kind=staged.source,
+        basis="uchol",
+    )

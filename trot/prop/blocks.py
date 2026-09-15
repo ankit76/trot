@@ -55,6 +55,7 @@ class MixedBlockFn(Protocol):
         trial_meas_ctx: Any,
         observable_names: tuple[str, ...] = (),
         sr_fn: Callable = wk.stochastic_reconfiguration,
+        measure_trial: bool = True,
     ) -> tuple[PropState, BlockObs]: ...
 
 
@@ -304,11 +305,17 @@ def block_mixed(
     trial_meas_ctx: Any,
     observable_names: tuple[str, ...] = (),
     sr_fn: Callable = wk.stochastic_reconfiguration,
+    measure_trial: bool = True,
 ) -> tuple[PropState, BlockObs]:
     """
     Block function for mixed sampling -- Trial =! Guide
     propagation(Guide) + measurement(Trial)
     currently only support pt2CCSD trial
+
+    measure_trial=False skips the trial estimator entirely and returns guide scalars
+    only. During equilibration the walkers are governed purely by the guide, so the
+    trial energy is not used for anything and evaluating it is wasted work. The returned
+    BlockObs then has no trial_* keys, so callers must branch on the same flag.
     TODO generalize the output of trial kernel to multiple variable
          without saving each term according to their names
     """
@@ -346,17 +353,21 @@ def block_mixed(
     )  # local energy with respect to the guiding wavefunction = <guide|H|walker>/<guide|walker>
     guide_e_samples = jnp.real(guide_e_samples)
 
+    # Outlier rejection, judged on the GUIDE local energy.
+    #
+    # A walker whose guide energy has run away is discarded by zeroing its weight, not
+    # by clamping its energy: clamping would leave it contributing its full weight to
+    # the trial averages further down, since trial_weights is built from guide_weights.
+    # The energy is still replaced by e_ref so that a nan cannot survive as nan * 0.
     thresh = jnp.sqrt(2.0 / jnp.asarray(params.dt))
     e_ref = state.e_estimate
-    is_nan = ~jnp.isfinite(guide_e_samples)
-    guide_e_samples = jnp.where(
-        is_nan | (jnp.abs(guide_e_samples - e_ref) > thresh), e_ref, guide_e_samples
-    )
+    is_bad = ~jnp.isfinite(guide_e_samples) | (jnp.abs(guide_e_samples - e_ref) > thresh)
+    guide_e_samples = jnp.where(is_bad, e_ref, guide_e_samples)
 
-    guide_weights = jnp.where(is_nan, 0.0, state.weights)
+    guide_weights = jnp.where(is_bad, 0.0, state.weights)
     guide_w_block = jnp.sum(guide_weights)
-    guide_w_block_safe = jnp.where(guide_w_block == 0, 1.0, guide_w_block)
-    guide_e_block = jnp.sum(guide_weights * guide_e_samples) / guide_w_block_safe
+    # guide_w_block_safe = jnp.where(guide_w_block == 0, 1.0, guide_w_block)
+    guide_e_block = jnp.sum(guide_weights * guide_e_samples) / guide_w_block
     guide_e_block = jnp.where(guide_w_block == 0, e_ref, guide_e_block)
 
     alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(guide_e_block))
@@ -365,11 +376,38 @@ def block_mixed(
         e_estimate=(1.0 - alpha) * state.e_estimate + alpha * guide_e_block,
     )
 
+    obs_samples: dict[str, jax.Array] = {}
+
+    if not measure_trial:
+        # equilibration: the trial estimator is not used, so do not pay for it
+        key, subkey = jax.random.split(state.rng_key)
+        zeta = jax.random.uniform(subkey)
+        w_sr, weights_sr = sr_fn(state.walkers, state.weights, zeta, sys.walker_kind)
+        overlaps_sr = wk.vmap_chunked(
+            guide_meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
+        )(w_sr, guide_data)
+        state = state._replace(walkers=w_sr, weights=weights_sr, overlaps=overlaps_sr, rng_key=key)
+        return state, BlockObs(
+            scalars={"guide_weight": guide_w_block, "guide_energy": guide_e_block},
+            observables=obs_samples,
+        )
+
     # measuing with respect to trial
     trial_e_kernel = trial_meas_ops.require_kernel(k_energy)
-    pt2results = wk.vmap_chunked(
-        trial_e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
-    )(state.walkers, ham_data, trial_meas_ctx, trial_data)
+    if trial_meas_ops.needs_rng(k_energy):
+        # a stochastic estimator gets a fresh key per walker every block: sharing one
+        # would make every walker sample the same terms, and reusing the block key would
+        # freeze the draws for the whole run
+        rng_key, sub = jax.random.split(state.rng_key)
+        state = state._replace(rng_key=rng_key)
+        walker_keys = jax.random.split(sub, wk.n_walkers(state.walkers))
+        pt2results = wk.vmap_chunked(
+            trial_e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None, 0)
+        )(state.walkers, ham_data, trial_meas_ctx, trial_data, walker_keys)
+    else:
+        pt2results = wk.vmap_chunked(
+            trial_e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+        )(state.walkers, ham_data, trial_meas_ctx, trial_data)
     trial_t2s, trial_e0s, trial_e1s = pt2results[:, 0], pt2results[:, 1], pt2results[:, 2]
     trial_overlaps = wk.vmap_chunked(
         trial_meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
@@ -381,8 +419,6 @@ def block_mixed(
     trial_t2_block = jnp.sum(trial_weights * trial_t2s) / trial_w_block
     trial_e0_block = jnp.sum(trial_weights * trial_e0s) / trial_w_block
     trial_e1_block = jnp.sum(trial_weights * trial_e1s) / trial_w_block
-
-    obs_samples: dict[str, jax.Array] = {}
 
     # performing SR at the end of Block propagation and measurement (Guide)
     key, subkey = jax.random.split(state.rng_key)

@@ -24,6 +24,10 @@ class CholAfqmcCtx:
     chol_flat: jax.Array  # (n_fields, n*n)
     norb: int
 
+    @property
+    def n_fields(self) -> int:
+        return int(self.chol_flat.shape[0])
+
     def tree_flatten(self):
         return (
             self.dt,

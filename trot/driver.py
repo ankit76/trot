@@ -127,7 +127,7 @@ def make_run_mixed_blocks(
     improve compilation, as these objects can be large.
     """
 
-    @partial(jax.jit, static_argnames=("n_blocks",))
+    @partial(jax.jit, static_argnames=("n_blocks", "measure_trial"))
     def run_mixed_blocks(
         state0,
         *,
@@ -138,6 +138,7 @@ def make_run_mixed_blocks(
         trial_data,
         trial_meas_ctx,
         n_blocks: int,
+        measure_trial: bool = True,
     ):
         def one_block(state, _):
             state, obs = mixed_block_fn(
@@ -155,6 +156,7 @@ def make_run_mixed_blocks(
                 trial_meas_ops=trial_meas_ops,
                 trial_meas_ctx=trial_meas_ctx,
                 observable_names=observable_names,
+                measure_trial=measure_trial,
             )
             obs_tuple = tuple(obs.observables[name] for name in observable_names)
             return state, (obs.scalars, obs_tuple)
@@ -418,6 +420,7 @@ def run_mixed_qmc(
     trial_data: Any,
     trial_meas_ops: MeasOps,
     mix_block_fn: MixedBlockFn,
+    blocking_fn: Callable[..., Any] = pt2ccsd_blocking,
     state: PropState | None = None,
     guide_meas_ctx: Any | None = None,
     trial_meas_ctx: Any | None = None,
@@ -428,7 +431,14 @@ def run_mixed_qmc(
     """
     equilibration blocks then sampling blocks.
     Guide != Trial
-    Currently only support pt2CCSD trial without observables
+    The importance sampling is governed by the Guide
+    and the energy measurement is projected against the Trial.
+    Though we also measure the energy against the Guide to update the
+    e_estimate and use as a reference to remove extreme outliers.
+
+    AFQMC energy against the Trial is only measured during the sampling
+    NOTE Currently only support pt2CCSD trial without observables
+    TODO make it more general to other type of mixing guide-trial
 
     Returns:
       MixedQmcResult with energy statistics plus block-level observable estimates.
@@ -500,12 +510,13 @@ def run_mixed_qmc(
     guide_block_w_eq.append(jnp.sum(state.weights))
     # trial_block_e_eq.append(trial_energy0)
     # trial_block_w_eq.append(jnp.sum(trial_weights0))
-    print("\nEquilibration:\n")
+    print("\nEquilibration:")
+    print("E_Trial is not measured till the sampling phase\n")
     if print_every:
         print(
             f"{'':4s}"
             f"{'block':>9s}  "
-            f"{'1/Tmp':>6s}  "
+            f"{'tau':>6s}  "
             f"{'Guide_E_blk':>14s}  "
             f"{'Guide_W_blk':>12s}   "
             f"{'Trial_E_blk':>14s}  "
@@ -535,6 +546,7 @@ def run_mixed_qmc(
             trial_data=trial_data,
             trial_meas_ctx=trial_meas_ctx,
             n_blocks=n,
+            measure_trial=False,
         )
         # guide
         guide_block_e_eq.extend(scalars_chunk["guide_energy"].tolist())
@@ -543,35 +555,15 @@ def run_mixed_qmc(
         guide_w_chunk = scalars_chunk["guide_weight"]
         guide_w_chunk_avg = jnp.mean(guide_w_chunk)
         guide_e_chunk_avg = jnp.mean(guide_e_chunk * guide_w_chunk) / guide_w_chunk_avg
-        # trial
-        trial_block_w_eq.extend(scalars_chunk["trial_weight"].tolist())
-        trial_block_t2_eq.extend(scalars_chunk["trial_t2"].tolist())
-        trial_block_e0_eq.extend(scalars_chunk["trial_e0"].tolist())
-        trial_block_e1_eq.extend(scalars_chunk["trial_e1"].tolist())
-        # for i, name in enumerate(observable_names):
-        #     block_obs_eq[name].append(obs_chunk[i])
-        trial_w_chunk = scalars_chunk["trial_weight"]
-        trial_t2_chunk = scalars_chunk["trial_t2"]
-        trial_e0_chunk = scalars_chunk["trial_e0"]
-        trial_e1_chunk = scalars_chunk["trial_e1"]
-        trial_w_chunk_avg = jnp.mean(trial_w_chunk)
-        trial_t2_chunk_avg = jnp.mean(trial_w_chunk * trial_t2_chunk) / trial_w_chunk_avg
-        trial_e0_chunk_avg = jnp.mean(trial_w_chunk * trial_e0_chunk) / trial_w_chunk_avg
-        trial_e1_chunk_avg = jnp.mean(trial_w_chunk * trial_e1_chunk) / trial_w_chunk_avg
-        pt2trial_energy_avg = (
-            ham_data.h0
-            + trial_e0_chunk_avg
-            + trial_e1_chunk_avg
-            - trial_t2_chunk_avg * trial_e0_chunk_avg
-        )
+        # the trial is deliberately not measured during equilibration
         elapsed = time.perf_counter() - t0
         print(
             f"[eql {start + n:4d}/{params.n_eql_blocks}]  "
             f"{(start + n) * block_time:6.2f}  "
             f"{float(guide_e_chunk_avg):14.10f}  "
             f"{float(guide_w_chunk_avg):12.6e}  "
-            f"{float(pt2trial_energy_avg.real):14.10f}  "
-            f"{float(trial_w_chunk_avg.real):12.6e}  "
+            f"{'-':>14s}  "
+            f"{'-':>12s}  "
             f"{int(state.node_encounters):10d}  "
             f"{elapsed:8.1f}"
         )
@@ -621,6 +613,7 @@ def run_mixed_qmc(
             trial_data=trial_data,
             trial_meas_ctx=trial_meas_ctx,
             n_blocks=n,
+            measure_trial=True,
         )
         # guide
         # guide_w_chunk = scalars_chunk["guide_weight"]
@@ -650,14 +643,18 @@ def run_mixed_qmc(
         # trial_e0_avg = jnp.mean(jnp.asarray(trial_block_w_sp) * jnp.asarray(trial_block_e0_sp)) / trial_w_avg
         # trial_e1_avg = jnp.mean(jnp.asarray(trial_block_w_sp) * jnp.asarray(trial_block_e1_sp)) / trial_w_avg
         # trial_e_avg = ham_data.h0 + trial_e0_avg + trial_e1_avg - trial_t2_avg * trial_e0_avg
-        trial_e_avg, trial_error = pt2ccsd_blocking(
+        # progress reporting only: no blocking sweep, so this stays defined while the
+        # run is still accumulating blocks. Returns None if there is nothing to report.
+        trial_stats = blocking_fn(
             ham_data.h0,
             jnp.asarray(trial_block_w_sp),
             jnp.asarray(trial_block_t2_sp),
             jnp.asarray(trial_block_e0_sp),
             jnp.asarray(trial_block_e1_sp),
             printQ=False,
+            final=False,
         )
+        trial_e_avg, trial_error = (None, None) if trial_stats is None else trial_stats
 
         print(
             f"[blk {start + n:4d}/{params.n_blocks}]  "
@@ -665,8 +662,8 @@ def run_mixed_qmc(
             f"{(f'{guide_se:10.3e}' if guide_se is not None else ' ' * 10)}  "
             # f"{float(guide_e_avg):16.10f}  "
             f"{float(guide_w_avg):12.6e}  "
-            f"{float(trial_e_avg.real):14.10f}  "
-            f"{float(trial_error.real):10.3e}  "
+            f"{(f'{float(trial_e_avg.real):14.10f}' if trial_e_avg is not None else ' ' * 14)}  "
+            f"{(f'{float(trial_error.real):10.3e}' if trial_error is not None else ' ' * 10)}  "
             f"{nodes:10d}  "
             f"{dt_per_block:9.3f}  "
             f"{elapsed:8.1f}"
@@ -740,16 +737,32 @@ def run_mixed_qmc(
     guide_stats = blocking_analysis_ratio(guide_block_e_sp, guide_block_w_sp, print_q=True)
     guide_e_mean, guide_e_err = guide_stats["mu"], guide_stats["se_star"]
 
-    trial_e_mean, trial_e_err = pt2ccsd_blocking(
+    trial_args = (
         ham_data.h0,
         trial_block_w_sp_clean,
         trial_block_t2_sp_clean,
         trial_block_e0_sp_clean,
         trial_block_e1_sp_clean,
-        printQ=True,
     )
+    trial_stats = blocking_fn(*trial_args, printQ=True, final=True)
+    if trial_stats is None:
+        # too few blocks for a blocking sweep; fall back to the unblocked estimate, which
+        # ignores autocorrelation and so understates the error
+        print(
+            "Too few sampling blocks for a blocking analysis; "
+            "falling back to the unblocked error, which is a lower bound."
+        )
+        trial_stats = blocking_fn(*trial_args, printQ=False, final=False)
 
-    print(f"AFQMC/pt2CCSD energy = {trial_e_mean.real:.6f} +/- {trial_e_err.real:.6f} (1-sigma)")
+    if trial_stats is None:
+        trial_e_mean = jnp.asarray(float("nan"))
+        trial_e_err = jnp.asarray(float("nan"))
+        print("AFQMC/pt2CCSD energy = not enough samples to report")
+    else:
+        trial_e_mean, trial_e_err = trial_stats
+        print(
+            f"AFQMC/pt2CCSD energy = {trial_e_mean.real:.6f} +/- {trial_e_err.real:.6f} (1-sigma)"
+        )
 
     return MixedQmcResult(
         guide_mean_energy=guide_e_mean,

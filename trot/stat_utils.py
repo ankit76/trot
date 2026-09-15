@@ -334,10 +334,88 @@ def clean_pt2ccsd(ept_sp, wt_sp, t2_sp, e0_sp, e1_sp, zeta=20):
     return (wt_clean, t2_clean, e0_clean, e1_clean)
 
 
+def _pt2ccsd_energy(h0, weights, t2_sp, e0_sp, e1_sp):
+    """E = h0 + <e0> + <e1> - <t2><e0>, with <x> = sum(w x) / sum(w)."""
+    wt_avg = jnp.mean(weights)
+    t2_avg = jnp.mean(weights * t2_sp) / wt_avg
+    e0_avg = jnp.mean(weights * e0_sp) / wt_avg
+    e1_avg = jnp.mean(weights * e1_sp) / wt_avg
+    return h0 + e0_avg + e1_avg - t2_avg * e0_avg
+
+
+def _pt2ccsd_delta_method_error(weights, t2_sp, e0_sp, e1_sp):
+    """
+    Weight aware naive error for the pt2CCSD estimator, without blocking.
+
+    In aggregate form E = h0 + E0/W + E1/W - T2 E0 / W**2 with E0 = sum(w e0) and so on.
+    Propagate each sample's contribution to the aggregates through a first order
+    linearization to get its influence on E, then take the variance of the mean.
+
+    Ignores autocorrelation between blocks, so it underestimates the true error; it is
+    for progress reporting, not for a final number.
+    """
+    w = weights
+    n = len(w)
+    e0_agg = jnp.sum(w * e0_sp)
+    e1_agg = jnp.sum(w * e1_sp)
+    t2_agg = jnp.sum(w * t2_sp)
+    w_agg = jnp.sum(w)
+
+    # partials of E with respect to each aggregate (E0 enters twice)
+    d_e0 = 1.0 / w_agg - t2_agg / w_agg**2
+    d_e1 = 1.0 / w_agg
+    d_t2 = -e0_agg / w_agg**2
+    d_w = -e0_agg / w_agg**2 - e1_agg / w_agg**2 + 2.0 * t2_agg * e0_agg / w_agg**3
+
+    infl = (d_e0 * (w * e0_sp) + d_e1 * (w * e1_sp) + d_t2 * (w * t2_sp) + d_w * w).real
+    var_mean = jnp.sum(infl**2) * n / (n - 1)
+    return jnp.sqrt(var_mean).real
+
+
 def pt2ccsd_blocking(
-    h0, weights, t2_sp, e0_sp, e1_sp, printQ=False, min_blocks=5, plateau_window=2, plateau_tol=0.04
+    h0,
+    weights,
+    t2_sp,
+    e0_sp,
+    e1_sp,
+    printQ=False,
+    min_blocks=5,
+    plateau_window=2,
+    plateau_tol=0.04,
+    final=True,
 ):
+    """
+    Blocking analysis for the pt2CCSD total energy estimator
+
+        E = h0 + <e0> + <e1> - <t2><e0>,     <x> = sum(w x) / sum(w)
+
+    which is nonlinear in the block averages, so the three components have to be
+    averaged separately and combined afterwards.
+
+    final=True   full blocking sweep over block sizes, with plateau detection.
+                 Needs enough samples for at least min_blocks blocks.
+    final=False  no blocking. The error comes from a first order (delta method)
+                 linearization of the estimator, treating each sample as independent.
+                 Cheap and defined from two samples up, so it is what to use for
+                 progress reporting while a run is still accumulating blocks.
+
+    Returns
+    -------
+    (energy, error), or **None** when there are too few samples for the requested
+    analysis. Callers must check: with a handful of blocks there is genuinely no error
+    estimate to give, and returning a fabricated one would be worse than saying so.
+    """
     nsample = len(weights)
+
+    # the energy itself only needs one sample, but an error never does
+    if nsample < 2:
+        return None
+
+    energy_avg = _pt2ccsd_energy(h0, weights, t2_sp, e0_sp, e1_sp)
+
+    if not final:
+        return energy_avg.real, _pt2ccsd_delta_method_error(weights, t2_sp, e0_sp, e1_sp)
+
     max_size = max(1, nsample // min_blocks)
 
     block_errs = []
@@ -376,6 +454,10 @@ def pt2ccsd_blocking(
         block_means.append(block_mean)
         block_errs.append(block_error)
 
+    if not block_errs:
+        # not enough samples for even one block size at this min_blocks
+        return None
+
     # --- Plateau detection ---
     errs = jnp.array(block_errs)
     plateau_idx = None
@@ -392,13 +474,6 @@ def pt2ccsd_blocking(
         err = jnp.mean(errs[plateau_idx : plateau_idx + plateau_window])
     else:
         err = errs.max()
-
-    # --- Overall energy ---
-    wt_avg = jnp.mean(weights)
-    t2_avg = jnp.mean(weights * t2_sp) / wt_avg
-    e0_avg = jnp.mean(weights * e0_sp) / wt_avg
-    e1_avg = jnp.mean(weights * e1_sp) / wt_avg
-    energy_avg = h0 + e0_avg + e1_avg - t2_avg * e0_avg
 
     # --- Printing ---
     if printQ:

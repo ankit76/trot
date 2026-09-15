@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -8,18 +8,25 @@ from jax.sharding import Mesh
 
 from .. import walkers as wk
 from ..core.ops import MeasOps, TrialOps, k_energy, k_force_bias
-from ..core.system import System
-from ..ham.chol import HamBasis, HamChol
+from ..core.system import System, System_uh
+from ..ham.chol import HamBasis
+from ..ham.chol_u import HamBasisU
 from ..sharding import shard_prop_state
-from ..walkers import init_walkers
+from ..walkers import init_walkers, init_walkers_uh
 from .chol_afqmc_ops import CholAfqmcCtx, TrotterOps, _build_prop_ctx, make_trotter_ops
+from .chol_afqmc_ops_u import (
+    CholAfqmcCtxU,
+    TrotterOpsU,
+    _build_prop_ctx_u,
+    make_trotter_ops_u,
+)
 from .types import PropOps, PropState, QmcParamsBase
 
 
 def init_prop_state(
     *,
-    sys: System,
-    ham_data: HamChol,
+    sys: System | System_uh,
+    ham_data: Any,
     trial_ops: TrialOps,
     trial_data: Any,
     meas_ops: MeasOps,
@@ -40,7 +47,7 @@ def init_prop_state(
     if initial_walkers is None:
         if rdm1 is None:
             rdm1 = trial_ops.get_rdm1(trial_data)
-        initial_walkers = init_walkers(sys=sys, rdm1=rdm1, n_walkers=n_walkers)
+        initial_walkers = init_walkers(sys=cast(System, sys), rdm1=rdm1, n_walkers=n_walkers)
 
     overlaps = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
         initial_walkers, trial_data
@@ -76,21 +83,60 @@ def init_prop_state(
     return shard_prop_state(state, mesh)
 
 
+def init_prop_state_uh(
+    *,
+    sys: System | System_uh,
+    ham_data: Any,
+    trial_ops: TrialOps,
+    trial_data: Any,
+    meas_ops: MeasOps,
+    params: QmcParamsBase,
+    initial_walkers: Any | None = None,
+    initial_e_estimate: jax.Array | None = None,
+    rdm1: jax.Array | None = None,
+    mesh: Mesh | None = None,
+) -> PropState:
+    """
+    Initialize AFQMC propagation state for an unrestricted hamiltonian.
+
+    Same as init_prop_state except that walkers come from init_walkers_uh, since
+    init_walkers takes a stacked (2, norb, norb) rdm1 and so cannot build walkers whose
+    two spin blocks have different orbital dimensions.
+    """
+    if initial_walkers is None:
+        if rdm1 is None:
+            rdm1 = trial_ops.get_rdm1(trial_data)
+        initial_walkers = init_walkers_uh(sys, rdm1, params.n_walkers)
+
+    return init_prop_state(
+        sys=sys,
+        ham_data=ham_data,
+        trial_ops=trial_ops,
+        trial_data=trial_data,
+        meas_ops=meas_ops,
+        params=params,
+        initial_walkers=initial_walkers,
+        initial_e_estimate=initial_e_estimate,
+        rdm1=rdm1,
+        mesh=mesh,
+    )
+
+
 def afqmc_step(
     state: PropState,
     *,
     params: QmcParamsBase,
-    ham_data: HamChol,
+    ham_data: Any,
     trial_data: Any,
     meas_ops: MeasOps,
-    trotter_ops: TrotterOps,
-    prop_ctx: CholAfqmcCtx,
+    trotter_ops: TrotterOps | TrotterOpsU,
+    prop_ctx: CholAfqmcCtx | CholAfqmcCtxU,
     meas_ctx: Any,
 ) -> PropState:
 
     key, subkey = jax.random.split(state.rng_key)
     nw = wk.n_walkers(state.walkers)
-    fields = jax.random.normal(subkey, (nw, prop_ctx.chol_flat.shape[0]))
+    fields = jax.random.normal(subkey, (nw, prop_ctx.n_fields))
 
     fb_kernel = meas_ops.require_kernel(k_force_bias)
     force_bias = wk.vmap_chunked(
@@ -178,3 +224,40 @@ def make_prop_ops(ham_basis: HamBasis, walker_kind: str, mixed_precision=False) 
         )
 
     return PropOps(init_prop_state=init_prop_state, build_prop_ctx=build_prop_ctx, step=step)
+
+
+def make_prop_ops_u(ham_basis: HamBasisU, walker_kind: str, mixed_precision=False) -> PropOps:
+    """differ from make_prop_ops by return _build_prop_ctx_u which builds unrestricted hamiltonian"""
+    trotter_ops = make_trotter_ops_u(ham_basis, walker_kind, mixed_precision=mixed_precision)
+
+    def step(
+        state: PropState,
+        *,
+        params: QmcParamsBase,
+        ham_data: Any,
+        trial_data: Any,
+        trial_ops: TrialOps,
+        meas_ops: MeasOps,
+        meas_ctx: Any,
+        prop_ctx: Any,
+    ) -> PropState:
+        return afqmc_step(
+            state,
+            params=params,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            meas_ops=meas_ops,
+            meas_ctx=meas_ctx,
+            prop_ctx=prop_ctx,
+            trotter_ops=trotter_ops,
+        )
+
+    def build_prop_ctx(ham_data: Any, rdm1: jax.Array, params: QmcParamsBase) -> CholAfqmcCtxU:
+        return _build_prop_ctx_u(
+            ham_data,
+            rdm1,
+            params.dt,
+            chol_flat_precision=jnp.float32 if mixed_precision else jnp.float64,
+        )
+
+    return PropOps(init_prop_state=init_prop_state_uh, build_prop_ctx=build_prop_ctx, step=step)

@@ -106,6 +106,7 @@ def _is_slow_test(item: pytest.Item) -> bool:
         "test_cisd_fp.py",
         "test_ucisd_fp.py",
         "test_pt2ccsd.py",
+        "test_upt2ccsd.py",
         "test_io.py",
         "test_cis.py",
         "test_eom_cisd.py",

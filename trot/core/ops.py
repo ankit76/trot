@@ -113,6 +113,19 @@ class MeasKernel(Protocol):
     def __call__(self, walker: Any, ham_data: Any, meas_ctx: Any, trial_data: Any) -> jax.Array: ...
 
 
+class StochasticMeasKernel(Protocol):
+    """
+    A measurement kernel that draws random numbers, and so needs a key of its own per
+    walker: two walkers sharing a key would sample the same terms and correlate their
+    estimates. Kernels like this are named in MeasOps.stochastic_kernels, and the block
+    function splits the block key and passes one per walker as a trailing argument.
+    """
+
+    def __call__(
+        self, walker: Any, ham_data: Any, meas_ctx: Any, trial_data: Any, key: jax.Array
+    ) -> jax.Array: ...
+
+
 # usual kernel names
 k_energy = "energy"
 k_force_bias = "force_bias"
@@ -139,8 +152,16 @@ class MeasOps:
     # optional observables (e.g. "rdm1", "density_corr", ...)
     observables: Mapping[str, MeasKernel] = field(default_factory=dict)
 
+    # names of kernels that follow StochasticMeasKernel rather than MeasKernel, i.e. that
+    # take a trailing per-walker PRNG key
+    stochastic_kernels: frozenset[str] = frozenset()
+
     def has_kernel(self, name: str) -> bool:
         return name in self.kernels
+
+    def needs_rng(self, name: str) -> bool:
+        """Whether this kernel takes a per-walker PRNG key as a trailing argument."""
+        return name in self.stochastic_kernels
 
     def has_observable(self, name: str) -> bool:
         return name in self.observables
