@@ -154,7 +154,9 @@ def _make_ham_data(ham: HamInput | HamChol, mesh: Mesh | None, *, compact_chol: 
     return HamChol(
         jnp.asarray(ham.h0),
         jnp.asarray(ham.h1),
-        jnp.asarray(chol),
+        # Transfer directly: staging a NumPy array through jnp.asarray can
+        # compile an identity with a second full-size device allocation.
+        jax.device_put(chol),
         basis=ham.basis,
         nchol=runtime_n_chol,
     )
@@ -424,6 +426,7 @@ class DefaultRuntimeLayout:
                 job.trial_ops.get_rdm1(job.trial_data),
                 job.params,
             )
+            jax.block_until_ready(prop_ctx)
             _setup_end(t_prop, "propagation context ready")
         if meas_ctx is None:
             t_meas = _setup_begin("building measurement context")

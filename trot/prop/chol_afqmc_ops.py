@@ -121,12 +121,15 @@ def _unpack_symmetric_upper(packed: jax.Array, n: int) -> jax.Array:
     return packed[packed_indices]
 
 
+@partial(jax.jit, static_argnames=("dtype", "packed_cholesky"))
 def _prepare_chol_for_vhs(
     chol: jax.Array,
     *,
     dtype: jnp.dtype,
     packed_cholesky: bool,
 ) -> jax.Array:
+    # Fuse layout preparation with the cast; an eager FP64 reshape would
+    # allocate another full Cholesky tensor before making the FP32 output.
     if packed_cholesky:
         chol_vhs = _pack_symmetric_chol(chol)
     else:
