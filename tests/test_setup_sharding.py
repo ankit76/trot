@@ -22,7 +22,9 @@ from trot.meas.cisd_modes import (
     make_cisd_mode_meas_ops,
 )
 from trot.prop.afqmc import init_prop_state
-from trot.prop.chol_afqmc_ops import _build_prop_ctx, _sum_chol_squares
+from trot.prop.chol_afqmc_ops import (
+    _build_prop_ctx, _mf_shifts, _sum_chol_squares, _weighted_chol_sum,
+)
 from trot.prop.types import QmcParams
 from trot.sharding import cholesky_model_mesh, replicate, shard_model_axis
 from trot.trial.cisd_modes import CisdModeTrial, make_cisd_mode_trial_ops
@@ -55,6 +57,33 @@ def test_sharded_chol_squares_reduce_only_matrix(n_chol, complex_chol):
     _assert_no_gather(compiled)
     expected = np.einsum("gik,gkj->ij", chol, chol)
     np.testing.assert_allclose(compiled(sharded), expected, rtol=2e-12, atol=2e-12)
+
+
+@pytest.mark.parametrize("complex_chol", [False, True])
+def test_mean_field_setup_keeps_cholesky_inputs_sharded(complex_chol):
+    mesh = _mesh()
+    rng = np.random.default_rng(918)
+    chol = rng.normal(size=(14, 4, 4))
+    if complex_chol:
+        chol = chol + 1j * rng.normal(size=chol.shape)
+    density = np.diag([2.0, 1.0, 0.0, 0.0])
+    sharded = shard_model_axis(chol, mesh)
+    ham = HamChol(replicate(0.0, mesh), replicate(np.zeros((4, 4)), mesh), sharded)
+    rdm1 = replicate(density, mesh)
+    shifts_fn = _mf_shifts.lower(ham, rdm1).compile()
+    _assert_no_gather(shifts_fn)
+    shifts = shifts_fn(ham, rdm1)
+    assert shifts.sharding.spec == P("model")
+    expected_shifts = 1j * np.array([np.trace(matrix @ density) for matrix in chol])
+    np.testing.assert_allclose(shifts, expected_shifts, rtol=2e-12, atol=2e-12)
+
+    weights = (1j * shifts).real
+    potential_fn = _weighted_chol_sum.lower(weights, sharded).compile()
+    _assert_no_gather(potential_fn)
+    potential = potential_fn(weights, sharded)
+    expected = sum((w * matrix for w, matrix in zip((1j * expected_shifts).real, chol)),
+                   np.zeros((4, 4)))
+    np.testing.assert_allclose(potential, expected, rtol=2e-12, atol=2e-12)
 
 
 def _inputs(mesh, n_chol, mixed):

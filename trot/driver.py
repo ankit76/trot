@@ -47,7 +47,9 @@ from .walkers import stochastic_reconfiguration
 
 print = partial(print, flush=True)
 
-_AUTO_CHUNK_MEMORY_FRACTION = 0.95
+# Leave headroom for live buffers and execution overhead outside the compiled
+# memory estimate; 95% admitted a 5Z batch that failed at its first execution.
+_AUTO_CHUNK_MEMORY_FRACTION = 0.85
 _COMPILER_MEMORY_ERROR_MARKERS = (
     "resource_exhausted",
     "resource exhausted",

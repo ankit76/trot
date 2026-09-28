@@ -80,9 +80,21 @@ def _get_dm(rdm1: jax.Array, ham_basis: str) -> jax.Array:
     return dm
 
 
+@partial(
+    jax.jit,
+    # Setup profiling can copy the entire Cholesky input. Disable it for
+    # this compilation without changing production-kernel autotuning.
+    compiler_options={"xla_gpu_autotune_level": 0},
+)
 def _mf_shifts(ham_data: HamChol, rdm1: jax.Array) -> jax.Array:
     dm = _get_dm(rdm1, ham_data.basis)
     return 1.0j * jnp.einsum("gij,ji->g", ham_data.chol, dm, optimize="optimal")
+
+
+@partial(jax.jit, compiler_options={"xla_gpu_autotune_level": 0})
+def _weighted_chol_sum(weights: jax.Array, chol: jax.Array) -> jax.Array:
+    """One-time mean-field potential without autotuner copies of full chol."""
+    return jnp.einsum("g,gik->ik", weights, chol, optimize="optimal")
 
 
 def _build_exp_h1_half_from_h1(h1: jax.Array, dt: jax.Array) -> jax.Array:
@@ -206,7 +218,7 @@ def _get_h1_eff(ham_data: HamChol, mf: jax.Array) -> jax.Array:
                 ham_data.chol, mesh=cholesky_model_mesh(ham_data.chol)
             )
             mf_r = (1.0j * mf).real
-            v1m = jnp.einsum("g,gik->ik", mf_r, ham_data.chol, optimize="optimal")
+            v1m = _weighted_chol_sum(mf_r, ham_data.chol)
             h1_eff = ham_data.h1 - v0m - v1m
         case _:
             raise ValueError(f"Unknown Hamiltonian basis kind: {ham_data.basis}")

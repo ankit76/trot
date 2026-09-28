@@ -109,12 +109,22 @@ def test_auto_chunks_reuses_first_candidate_when_it_fits(monkeypatch):
         n_eql_blocks=50,
         n_blocks=100,
     )
-    selected, run_blocks, built = _select(monkeypatch, params, {1: 950})
+    selected, run_blocks, built = _select(monkeypatch, params, {1: 850})
 
     assert selected.n_chunks == 1
     assert run_blocks is built[0]
     assert built[0].lower_kwargs is not None
     assert built[0].lower_kwargs["n_blocks"] == 10
+
+
+def test_auto_chunks_reserves_execution_headroom(monkeypatch):
+    # Regression: a candidate below the old 95% limit must now be rejected.
+    params = QmcParams(n_walkers=8, n_chunks=1)
+    selected, run_blocks, built = _select(monkeypatch, params, {1: 900, 2: 700})
+
+    assert [candidate.n_chunks for candidate in built] == [1, 2]
+    assert selected.n_chunks == 2
+    assert run_blocks is built[-1]
 
 
 def test_auto_chunks_increases_until_compiler_estimate_fits(monkeypatch):

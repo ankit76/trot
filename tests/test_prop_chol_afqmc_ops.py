@@ -8,7 +8,9 @@ jax.config.update("jax_enable_x64", True)
 from trot.ham.chol import HamChol
 from trot.prop.chol_afqmc_ops import (
     _build_prop_ctx,
+    _get_h1_eff,
     _make_vhs_split_flat,
+    _mf_shifts,
     _packed_upper_size,
     _sum_chol_squares,
     make_trotter_ops,
@@ -41,6 +43,34 @@ def test_build_prop_ctx_shapes_and_nfields():
     assert ctx.dt.shape == ()
     assert ctx.sqrt_dt.shape == ()
     assert ctx.h0_prop.shape == ()
+
+
+@pytest.mark.parametrize("basis,spin_resolved", [
+    ("restricted", False), ("restricted", True), ("generalized", False),
+])
+@pytest.mark.parametrize("complex_inputs", [False, True])
+@pytest.mark.parametrize("n_fields", [0, 7])
+def test_mean_field_setup_matches_dense_reference(basis, spin_resolved, complex_inputs, n_fields):
+    rng = np.random.default_rng(317)
+    chol = 0.1 * rng.normal(size=(n_fields, 4, 4))
+    densities = rng.normal(size=(2, 4, 4))
+    if complex_inputs:
+        # Nonsymmetric complex inputs distinguish transposition from conjugation.
+        chol = chol + 0.1j * rng.normal(size=chol.shape)
+        densities = densities + 1j * rng.normal(size=densities.shape)
+    dm = densities.sum(axis=0)
+    h1 = np.diag(np.arange(4.0))
+    ham = HamChol(jnp.asarray(1.0), jnp.asarray(h1), jnp.asarray(chol), basis=basis)
+    rdm1 = densities if spin_resolved else dm
+    shifts = 1j * np.array([np.trace(matrix @ dm) for matrix in chol])
+    normal_ordering = sum((matrix @ matrix for matrix in chol), np.zeros((4, 4))) / 2
+    potential = sum((weight * matrix for weight, matrix in zip((1j * shifts).real, chol)),
+                    np.zeros((4, 4)))
+
+    actual_shifts = _mf_shifts(ham, jnp.asarray(rdm1))
+    np.testing.assert_allclose(actual_shifts, shifts, rtol=2e-12, atol=2e-12)
+    np.testing.assert_allclose(_get_h1_eff(ham, actual_shifts), h1 - normal_ordering - potential,
+                               rtol=2e-12, atol=2e-12)
 
 
 @pytest.mark.parametrize("n_fields", [0, 1, 256, 257, 513])
