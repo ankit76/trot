@@ -158,8 +158,9 @@ def make_prop_ops(
     ham_basis: HamBasis,
     walker_kind: str,
     mixed_precision: bool = False,
-    packed_cholesky: bool = False,
+    packed_cholesky: bool | None = None,
 ) -> PropOps:
+    """Build propagation ops; None packs real FP32 VHS factors, assuming symmetry."""
     trotter_ops = make_trotter_ops(ham_basis, walker_kind, mixed_precision=mixed_precision)
 
     def step(

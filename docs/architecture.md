@@ -77,6 +77,20 @@ Python. An explicit argument overrides the environment setting. This policy
 controls matrix-product arithmetic independently of mixed-precision array
 storage; selecting `"highest"` does not promote float32 arrays to float64.
 
+With mixed precision, the FP32 VHS Cholesky copy stores only the upper triangle
+for real factors, assuming the symmetric matrices produced by molecular staging.
+This decision uses the input dtype only; no numerical symmetry scan is performed.
+Complex factors remain unpacked. Full-precision propagation retains its unpacked
+default, and matrix-product precision is unchanged.
+
+Use `setup(..., prop_kwargs={"packed_cholesky": False})` or
+`Afqmc(...).build_job(prop_kwargs={"packed_cholesky": False})` to opt out. Callers
+supplying nonsymmetric real factors must use this override. Low-level
+`make_prop_ops(..., packed_cholesky=None)` uses the automatic policy; explicit
+`True` also packs real factors in full precision. The resolved layout is printed
+at setup. Device setup and HF/dense-CISD host setup use the same policy.
+Measurement storage and the staging archive format are unchanged.
+
 A simulation has three stages: **staging**, **job assembly**, and
 **QMC execution**.
 

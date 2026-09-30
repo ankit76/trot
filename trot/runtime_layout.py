@@ -173,8 +173,9 @@ def _build_restricted_prop_ctx_from_host(
     dt: float,
     mixed_precision: bool,
     mesh: Mesh | None,
+    packed_cholesky: bool | None = None,
 ) -> CholAfqmcCtx:
-    from .prop.chol_afqmc_ops import CholAfqmcCtx
+    from .prop.chol_afqmc_ops import CholAfqmcCtx, _resolve_packed_cholesky
 
     ham = staged.ham
     chol = np.asarray(ham.chol)
@@ -207,8 +208,18 @@ def _build_restricted_prop_ctx_from_host(
     exp_h1_half_np = np.asarray(
         jax.device_get(jax.scipy.linalg.expm(-0.5 * jnp.asarray(dt) * jnp.asarray(h1_eff)))
     )
-    chol_flat = chol.reshape(n_chol, -1)
-    chol_flat_dtype = np.float32 if mixed_precision else chol_flat.dtype
+    chol_flat_dtype = np.float32 if mixed_precision else chol.dtype
+    packed_cholesky = _resolve_packed_cholesky(
+        chol, dtype=chol_flat_dtype, packed_cholesky=packed_cholesky,
+    )
+    if packed_cholesky:
+        rows, cols = np.triu_indices(norb)
+        chol_flat = np.empty((n_chol, len(rows)), dtype=chol_flat_dtype)
+        for start in range(0, n_chol, _HOST_CHOL_BLOCK_SIZE):
+            stop = min(start + _HOST_CHOL_BLOCK_SIZE, n_chol)
+            chol_flat[start:stop] = chol[start:stop, rows, cols]
+    else:
+        chol_flat = chol.reshape(n_chol, norb * norb)
 
     if mesh is not None and mesh.size > 1 and has_model_axis(mesh):
         dt_a = replicate(np.asarray(dt), mesh)
@@ -238,6 +249,7 @@ def _build_restricted_prop_ctx_from_host(
         h0_prop=h0_prop_a,
         chol_flat=chol_flat_a,
         norb=norb,
+        chol_packed=packed_cholesky,
     )
 
 
@@ -462,6 +474,7 @@ class DefaultRuntimeLayout:
 class RhfHostRuntimeLayout:
     mixed_precision: bool = True
     rhf_meas_cfg: RhfMeasCfg = RhfMeasCfg()
+    packed_cholesky: bool | None = None
 
     def make_initial_ham_data(self, ham: HamInput | HamChol, mesh: Mesh | None) -> HamChol:
         return _make_ham_data(ham, mesh, compact_chol=True)
@@ -489,6 +502,7 @@ class RhfHostRuntimeLayout:
                 dt=job.params.dt,
                 mixed_precision=self.mixed_precision,
                 mesh=job.mesh,
+                packed_cholesky=self.packed_cholesky,
             )
             _setup_end(t_prop, "propagation context ready")
         if meas_ctx is None:
@@ -523,6 +537,7 @@ class RhfHostRuntimeLayout:
 @dataclass(frozen=True)
 class CisdHostRuntimeLayout:
     mixed_precision: bool = True
+    packed_cholesky: bool | None = None
 
     def make_initial_ham_data(self, ham: HamInput | HamChol, mesh: Mesh | None) -> HamChol:
         return _make_ham_data(ham, mesh, compact_chol=False)
@@ -548,6 +563,7 @@ class CisdHostRuntimeLayout:
                 dt=job.params.dt,
                 mixed_precision=self.mixed_precision,
                 mesh=job.mesh,
+                packed_cholesky=self.packed_cholesky,
             )
             _setup_end(t_prop, "propagation context ready")
         if meas_ctx is None:
@@ -591,6 +607,7 @@ def make_runtime_layout(
     meas_ops_override: Any,
     prop_ops_override: Any,
     mixed_precision: bool,
+    packed_cholesky: bool | None = None,
 ) -> RuntimeLayout:
     rhf_meas_cfg = None
     if isinstance(meas_ops_override, MeasOps):
@@ -608,6 +625,7 @@ def make_runtime_layout(
         return RhfHostRuntimeLayout(
             mixed_precision=mixed_precision,
             rhf_meas_cfg=rhf_meas_cfg or RhfMeasCfg(),
+            packed_cholesky=packed_cholesky,
         )
 
     cisd_meas_cfg = None
@@ -623,5 +641,5 @@ def make_runtime_layout(
         and prop_ops_override is None
     )
     if use_host_cisd:
-        return CisdHostRuntimeLayout(mixed_precision=mixed_precision)
+        return CisdHostRuntimeLayout(mixed_precision=mixed_precision, packed_cholesky=packed_cholesky)
     return DefaultRuntimeLayout()

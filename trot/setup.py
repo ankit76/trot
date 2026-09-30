@@ -109,11 +109,13 @@ def _make_prop(
     sys: System | None = None,
     *,
     mixed_precision: bool,
+    packed_cholesky: bool | None = None,
 ) -> Any:
     return make_prop_ops(
         ham_data.basis,
         walker_kind,
         mixed_precision=mixed_precision,
+        packed_cholesky=packed_cholesky,
     )
 
 
@@ -488,6 +490,7 @@ def _assemble_job(
         meas_ops_override=meas_ops_override,
         prop_ops_override=prop_ops_override,
         mixed_precision=mixed_precision,
+        packed_cholesky=(prop_kwargs or {}).get("packed_cholesky"),
     )
     t_ham_runtime = _setup_begin("preparing runtime Hamiltonian")
     ham_data = runtime_layout.make_initial_ham_data(ham, mesh)
@@ -556,6 +559,9 @@ def setup(
     Basic usage:
         job = setup(mf)
         job.kernel()
+
+    Real FP32 VHS Choleskies are packed by default, assuming symmetric factors.
+    Set prop_kwargs={"packed_cholesky": False} to retain full VHS storage.
 
     Advanced usage:
         staged = stage(cc, cache="afqmc.h5")

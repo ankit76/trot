@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, NamedTuple, Tuple
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax, tree_util
@@ -103,6 +104,24 @@ def _build_exp_h1_half_from_h1(h1: jax.Array, dt: jax.Array) -> jax.Array:
 
 def _packed_upper_size(n: int) -> int:
     return n * (n + 1) // 2
+
+
+def _resolve_packed_cholesky(chol, *, dtype, packed_cholesky):
+    """Default to packing real FP32 VHS factors; real factors must be symmetric.
+
+    This is a dtype policy, not a numerical symmetry check. Callers supplying
+    nonsymmetric real factors must explicitly set packed_cholesky=False.
+    Complex factors always retain full storage.
+    """
+    if packed_cholesky is not None and not isinstance(packed_cholesky, bool):
+        raise TypeError("packed_cholesky must be None, True, or False")
+    requested = packed_cholesky is True or (
+        packed_cholesky is None and np.dtype(dtype) == np.dtype(np.float32)
+    )
+    packed = requested and np.issubdtype(chol.dtype, np.floating)
+    print(f"[setup] VHS Cholesky storage: {'packed upper triangle' if packed else 'full'} "
+          f"| dtype={np.dtype(dtype).name}", flush=True)
+    return packed
 
 
 def _pack_symmetric_chol(chol: jax.Array) -> jax.Array:
@@ -234,8 +253,11 @@ def _build_prop_ctx(
     rdm1: jax.Array,
     dt: float,
     chol_flat_precision: jnp.dtype = jnp.float64,
-    packed_cholesky: bool = False,
+    packed_cholesky: bool | None = None,
 ) -> CholAfqmcCtx:
+    packed_cholesky = _resolve_packed_cholesky(
+        ham_data.chol, dtype=chol_flat_precision, packed_cholesky=packed_cholesky,
+    )
     dt_a = jnp.array(dt)
     sqrt_dt = jnp.sqrt(dt_a)
 

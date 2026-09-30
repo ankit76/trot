@@ -332,7 +332,9 @@ def test_job_prepare_runtime_compacts_hf_chol_and_reuses_cached_ctx(
 
     sys_override = System(norb=norb, nelec=(nocc, nocc), walker_kind="restricted")
     meas_ops_override = make_rhf_meas_ops(sys_override, memory_mode=memory_mode)
-    job = setup(path, mesh=mesh, meas_ops=meas_ops_override)
+    # These deliberately nonsymmetric dummy factors require the explicit opt-out.
+    job = setup(path, mesh=mesh, meas_ops=meas_ops_override,
+                prop_kwargs={"packed_cholesky": False})
     assert job.mesh is mesh
     _assert_named_sharding_spec(job.ham_data.h0, P())
     _assert_named_sharding_spec(job.ham_data.h1, P())
