@@ -21,6 +21,7 @@ from .ham.chol import HamBasis
 # wavefunction inputs which can be used for building AFQMC objects.
 
 Array: TypeAlias = NDArray[Any]
+TrialFrozen: TypeAlias = int | NDArray | tuple[NDArray, NDArray]
 
 # to keep track of format versions when loading/saving staged inputs
 STAGE_FORMAT_VERSION = 1
@@ -53,7 +54,7 @@ def _normalize_frozen_list(frozen: Any, *, nmo: int) -> NDArray:
 
 
 def _mo_coeff_signature(mo_coeff: Any) -> tuple[tuple[int, ...], ...]:
-    if isinstance(mo_coeff, (tuple, list)):
+    if isinstance(mo_coeff, (tuple, list)) or np.ndim(mo_coeff) == 3:
         return tuple(tuple(int(dim) for dim in np.asarray(block).shape) for block in mo_coeff)
     return (tuple(int(dim) for dim in np.asarray(mo_coeff).shape),)
 
@@ -180,9 +181,7 @@ def _infer_restricted_trial_freeze_from_cc(
     nocc_act_expected = nocc_full - nocc_cc_frozen
     nvir_act_expected = (nmo_full - nocc_full) - nvir_cc_frozen
     if t1_shape != (nocc_act_expected, nvir_act_expected):
-        raise ValueError(
-            "cc.frozen is inconsistent with the CC amplitudes in the restricted CISD trial."
-        )
+        raise ValueError("cc.frozen is inconsistent with the CC singles amplitude shape.")
 
     nocc_t_core = nocc_cc_frozen - norb_frozen
     nvir_t_outer = nvir_cc_frozen
@@ -446,16 +445,25 @@ def _freeze_from_meta_value(frozen: Any) -> int | NDArray | None:
     raise TypeError(f"Unsupported frozen metadata type: {type(frozen)}")
 
 
-def _dump_frozen(group: h5py.Group, frozen: int | NDArray, *, attr_name: str = "frozen") -> None:
-    if isinstance(frozen, np.ndarray):
+def _dump_frozen(group: h5py.Group, frozen: TrialFrozen, *, attr_name: str = "frozen") -> None:
+    if isinstance(frozen, tuple):
+        spin_group = group.create_group(attr_name)
+        for spin, indices in zip(("alpha", "beta"), frozen):
+            spin_group.create_dataset(spin, data=np.asarray(indices, dtype=np.int64))
+    elif isinstance(frozen, np.ndarray):
         group.create_dataset(attr_name, data=np.asarray(frozen, dtype=np.int64))
     else:
         group.attrs[attr_name] = int(frozen)
 
 
-def _load_frozen(group: h5py.Group, *, attr_name: str = "frozen") -> int | NDArray:
+def _load_frozen(group: h5py.Group, *, attr_name: str = "frozen") -> TrialFrozen:
     if attr_name in group:
         dataset = group[attr_name]
+        if isinstance(dataset, h5py.Group):
+            return (
+                np.asarray(dataset["alpha"], dtype=np.int64),
+                np.asarray(dataset["beta"], dtype=np.int64),
+            )
         if not isinstance(dataset, h5py.Dataset):
             raise TypeError(f"Expected dataset '{attr_name}', got {type(dataset)}")
         return np.asarray(dataset[...], dtype=np.int64)
@@ -489,7 +497,7 @@ class TrialInput:
 
     kind: str  # "slater", "cisd", "ucisd"
     data: Dict[str, Array]
-    frozen: int | NDArray
+    frozen: TrialFrozen
     source_kind: str  # "mf" or "cc"
 
 
@@ -508,7 +516,7 @@ class StagedCc:
     kind: str  # "ccsd", "uccsd", "gccsd"
     cc: Any
     mf: Any
-    trial_frozen: int | NDArray
+    trial_frozen: TrialFrozen
     afqmc_frozen: int | NDArray
 
     def __init__(self, cc: Any, frozen: int | ArrayLike | None):
@@ -535,7 +543,16 @@ class StagedCc:
             kind = "gccsd"
 
         frozen = _stage_frozen(frozen)
-        cc_frozen = _stage_frozen(cc.frozen)
+        if kind == "uccsd" and isinstance(cc.frozen, (list, tuple, np.ndarray)):
+            # PySCF accepts a shared index list or two (possibly ragged) spin lists.
+            raw = cc.frozen
+            separate = len(raw) == 2 and all(np.ndim(x) == 1 for x in raw)
+            blocks = raw if separate else (raw, raw)
+            cc_frozen = tuple(
+                _normalize_frozen_list(block, nmo=_mo_coeff_nmo(mf.mo_coeff)) for block in blocks
+            )
+        else:
+            cc_frozen = _stage_frozen(cc.frozen)
 
         if cc_frozen is None:
             if frozen is not None and not (isinstance(frozen, int) and frozen == 0):
@@ -544,6 +561,25 @@ class StagedCc:
                 )
             afqmc_frozen = 0
             trial_frozen = 0
+        elif isinstance(cc_frozen, tuple):
+            if frozen is not None and not isinstance(frozen, int):
+                raise TypeError("UCCSD trial FNO requires an integer AFQMC frozen-core count.")
+            afqmc_frozen = 0 if frozen is None else frozen
+            for spin, (indices, t1) in enumerate(zip(cc_frozen, cc.t1)):
+                ncore_trial, _ = _infer_restricted_trial_freeze_from_cc(
+                    cc_frozen=indices,
+                    nmo_full=_mo_coeff_nmo(mf.mo_coeff),
+                    nocc_full=int(mf.mol.nelec[spin]),
+                    norb_frozen=afqmc_frozen,
+                    t1_shape=np.shape(t1),
+                )
+                if ncore_trial:
+                    raise NotImplementedError(
+                        "UCCSD trial-only occupied freezing is unsupported; set "
+                        "norb_frozen_core to the common occupied frozen-core count. "
+                        "Virtual FNO freezing leaves the AFQMC virtual space unchanged."
+                    )
+            trial_frozen = cc_frozen
         elif isinstance(cc_frozen, np.ndarray):
             if kind != "ccsd":
                 raise NotImplementedError(
@@ -608,7 +644,7 @@ class StagedMf:
     _delegate = {"mo_coeff", "mo_occ", "mol", "nelec", "get_ovlp", "energy_nuc", "get_hcore"}
     kind: str  # "rhf", "rohf", "uhf", ghf
     mf: Any  # Python SCF object
-    trial_frozen: int | NDArray
+    trial_frozen: TrialFrozen
     afqmc_frozen: int | NDArray
 
     def __init__(self, mf: Any, frozen: int | ArrayLike | None):
@@ -683,7 +719,7 @@ class StagedMfOrCc:
     mf_or_cc: Any  # StagedMf or StagedCc
     mf: StagedMf
     afqmc_frozen: int | NDArray
-    trial_frozen: int | NDArray
+    trial_frozen: TrialFrozen
 
     def __init__(self, mf_or_cc: Any, frozen: int | ArrayLike | None):
         from pyscf.cc.ccsd import CCSD
@@ -766,6 +802,10 @@ def stage(
             occupied/virtual blocks are inferred from ``cc.frozen`` while
             ``norb_frozen_core``/``norb_frozen`` control the occupied core orbitals removed
             from the AFQMC Hamiltonian.
+            UCCSD also accepts separate alpha/beta frozen lists with trailing virtual
+            blocks (trial FNO). Occupied frozen prefixes must both equal the explicit
+            AFQMC frozen-core count. Full MO coefficient matrices are required, ordered
+            [core | occupied | retained virtual | discarded virtual] in each spin.
         frozen_orbitals:
             Explicit orbital list for LNO-style staging. Generic AFQMC/FNO staging should use
             ``norb_frozen_core`` instead.

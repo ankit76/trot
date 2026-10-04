@@ -19,7 +19,9 @@ class PtuccsdThoulessTrial:
     basis. ``mo_t_b`` is the corresponding beta determinant in the beta MO
     basis, and ``mo_coeff_b`` rotates alpha-basis walkers into that beta basis.
     The three doubles blocks contain raw UCCSD amplitudes in ``(i,a,j,b)``
-    layout, without disconnected ``T1*T1`` terms.
+    layout, without disconnected ``T1*T1`` terms. Each spin basis is ordered
+    [occupied | retained virtual | discarded virtual]; T2 uses only retained
+    virtuals while the Thouless reference matrices have all orbital rows.
     """
 
     mo_t_a: jax.Array
@@ -39,7 +41,7 @@ class PtuccsdThoulessTrial:
 
         noa, nva = self.t2aa.shape[:2]
         nob, nvb = self.t2bb.shape[:2]
-        norb = noa + nva
+        norb = int(self.mo_t_a.shape[0])
         if self.t2aa.shape != (noa, nva, noa, nva):
             raise ValueError(
                 "t2aa must have shape (nocc_a,nvir_a,nocc_a,nvir_a); "
@@ -54,8 +56,8 @@ class PtuccsdThoulessTrial:
                 "t2bb must have shape (nocc_b,nvir_b,nocc_b,nvir_b); "
                 f"got {self.t2bb.shape}."
             )
-        if nob + nvb != norb:
-            raise ValueError("Alpha and beta orbital spaces must have the same size.")
+        if noa + nva > norb or nob + nvb > norb:
+            raise ValueError("Retained trial orbitals exceed the full orbital dimension.")
         if self.mo_t_a.shape != (norb, noa):
             raise ValueError(
                 f"mo_t_a must have shape {(norb, noa)}; got {self.mo_t_a.shape}."
@@ -80,8 +82,7 @@ class PtuccsdThoulessTrial:
 
     @property
     def nvir(self) -> tuple[int, int]:
-        noa, nob = self.nocc
-        return (self.norb - noa, self.norb - nob)
+        return (int(self.t2aa.shape[1]), int(self.t2bb.shape[1]))
 
     def tree_flatten(self):
         return (
@@ -107,10 +108,15 @@ class PtuccsdThoulessTrial:
         )
 
 
-def thouless_mo_from_t1(t1: jax.Array) -> jax.Array:
-    """Return occupied orbitals for ``exp(T1)|HF>`` in one spin MO basis."""
-    nocc, _ = t1.shape
-    return jnp.vstack([jnp.eye(nocc, dtype=t1.dtype), t1.T])
+def thouless_mo_from_t1(t1: jax.Array, norb: int | None = None) -> jax.Array:
+    """Return exp(T1)|HF> orbitals, with zero rows for discarded trial virtuals."""
+    nocc, nvir = t1.shape
+    occupied = jnp.vstack([jnp.eye(nocc, dtype=t1.dtype), t1.T])
+    if norb is None:
+        return occupied
+    if norb < nocc + nvir:
+        raise ValueError("Retained trial orbitals exceed the full orbital dimension.")
+    return jnp.pad(occupied, ((0, norb - nocc - nvir), (0, 0)))
 
 
 def _t2_from_pyscf_layout(t2: jax.Array) -> jax.Array:
@@ -150,8 +156,9 @@ def greens_unrestricted(
     )
 
 
-def greenp_from_green(green: jax.Array, nocc: int) -> jax.Array:
-    return (green - jnp.eye(green.shape[0], dtype=green.dtype))[:, nocc:]
+def greenp_from_green(green: jax.Array, nocc: int, nvir: int | None = None) -> jax.Array:
+    stop = green.shape[1] if nvir is None else nocc + nvir
+    return (green - jnp.eye(green.shape[0], dtype=green.dtype))[:, nocc:stop]
 
 
 def theta_t2_from_greens(
@@ -160,8 +167,8 @@ def theta_t2_from_greens(
     trial_data: PtuccsdThoulessTrial,
 ) -> jax.Array:
     noa, nob = trial_data.nocc
-    green_occ_a = green_a[:noa, noa:]
-    green_occ_b = green_b[:nob, nob:]
+    green_occ_a = green_a[:noa, noa : noa + trial_data.nvir[0]]
+    green_occ_b = green_b[:nob, nob : nob + trial_data.nvir[1]]
     theta_aa = 0.5 * jnp.einsum(
         "iajb,ia,jb->", trial_data.t2aa, green_occ_a, green_occ_a, optimize="optimal"
     )
@@ -253,19 +260,23 @@ def make_ptuccsd_thouless_trial_data(
     else:
         raise ValueError(f"Unknown PT-UCCSD t2_layout: {layout!r}")
 
+    mo_coeff_b_raw = data.get("mo_coeff_b", data.get("mo_b"))
+    if mo_coeff_b_raw is None:
+        raise KeyError("PT-UCCSD trial data requires 'mo_coeff_b' or 'mo_b'.")
+    mo_coeff_b_raw = jnp.asarray(mo_coeff_b_raw)
+    norb = int(mo_coeff_b_raw.shape[0])
+
     mo_t_a = (
         jnp.asarray(data["mo_t_a"])
         if "mo_t_a" in data
-        else thouless_mo_from_t1(jnp.asarray(data["t1a"]))
+        else thouless_mo_from_t1(jnp.asarray(data["t1a"]), norb)
     )
     mo_t_b = (
         jnp.asarray(data["mo_t_b"])
         if "mo_t_b" in data
-        else thouless_mo_from_t1(jnp.asarray(data["t1b"]))
+        else thouless_mo_from_t1(jnp.asarray(data["t1b"]), norb)
     )
-    mo_coeff_b_raw = data.get("mo_coeff_b", data.get("mo_b"))
-    if mo_coeff_b_raw is None:
-        raise KeyError("PT-UCCSD trial data requires 'mo_coeff_b' or 'mo_b'.")
+
     trial_data = PtuccsdThoulessTrial(
         mo_t_a=mo_t_a,
         mo_t_b=mo_t_b,

@@ -17,8 +17,11 @@ class UcisdTrial:
     Unrestricted CISD trial in an MO basis where the reference
     determinant occupies the first nocc[0] alpha and nocc[1] beta orbitals.
 
+    Each spin basis is ordered [occupied | retained virtual | discarded virtual].
+    nvir counts retained trial virtuals; norb remains the full Hamiltonian dimension.
+
     Arrays:
-      mo_coeff_b: (norb, nocc[1])
+      mo_coeff_b: (norb, norb), full beta-to-alpha orbital rotation
       c1a : (nocc[0], nvir[0])                      singles coefficients c_{i,alpha a,alpha}
       c1b : (nocc[1], nvir[1])                      singles coefficients c_{i,beta  a,beta }
       c2aa: (nocc[0], nvir[0], nocc[0], nvir[0])    doubles coefficients c_{i,alpha a,alpha j,alpha b,alpha}
@@ -116,8 +119,8 @@ def overlap_u(walker: tuple[jax.Array, jax.Array], trial_data: UcisdTrial) -> ja
     g_a = jnp.linalg.solve(woa.T, wa.T)  # (n_oa, norb)
     g_b = jnp.linalg.solve(wob.T, wb.T)  # (n_ob, norb)
 
-    g_a = g_a[:, n_oa:]
-    g_b = g_b[:, n_ob:]
+    g_a = g_a[:, n_oa : n_oa + trial_data.nvir[0]]
+    g_b = g_b[:, n_ob : n_ob + trial_data.nvir[1]]
     o0 = jnp.linalg.det(woa) * jnp.linalg.det(wob)
     o1 = jnp.einsum("ia,ia", c1a, g_a) + jnp.einsum("ia,ia", c1b, g_b)
     o2 = (
@@ -169,10 +172,10 @@ def overlap_g(walker: jax.Array, trial_data: UcisdTrial) -> jax.Array:
 
     g = (w @ jnp.linalg.inv(bra.T.conj() @ w) @ bra.T.conj()).T
 
-    g_aa = g[:n_oa, n_oa:norb]
-    g_bb = g[norb : norb + n_ob, norb + n_ob :]
-    g_ab = g[:n_oa, norb + n_ob :]
-    g_ba = g[norb : norb + n_ob, n_oa:norb]
+    g_aa = g[:n_oa, n_oa : n_oa + trial_data.nvir[0]]
+    g_bb = g[norb : norb + n_ob, norb + n_ob : norb + n_ob + trial_data.nvir[1]]
+    g_ab = g[:n_oa, norb + n_ob : norb + n_ob + trial_data.nvir[1]]
+    g_ba = g[norb : norb + n_ob, n_oa : n_oa + trial_data.nvir[0]]
 
     o1 = jnp.einsum("ia,ia", ci1A, g_aa) + jnp.einsum(
         "ia,ia",

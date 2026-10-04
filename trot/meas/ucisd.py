@@ -158,7 +158,6 @@ def force_bias_kernel_uw_rh(
     """Calculates force bias < psi_T | chol_gamma | walker > / < psi_T | walker >"""
     wa, wb = walker
     n_oa, n_ob = trial_data.nocc
-    n_va, n_vb = trial_data.nvir
     c1a = trial_data.c1a
     c1b = trial_data.c1b
     c2aa = trial_data.c2aa
@@ -175,10 +174,10 @@ def force_bias_kernel_uw_rh(
     green_a = _half_green_from_overlap_matrix(wa, woa)  # (n_oa, norb)
     green_b = _half_green_from_overlap_matrix(wb, wob)  # (n_ob, norb)
 
-    green_occ_a = green_a[:, n_oa:].copy()
-    green_occ_b = green_b[:, n_ob:].copy()
-    greenp_a = jnp.vstack((green_occ_a, -jnp.eye(n_va)))
-    greenp_b = jnp.vstack((green_occ_b, -jnp.eye(n_vb)))
+    green_occ_a = green_a[:, n_oa : n_oa + trial_data.nvir[0]].copy()
+    green_occ_b = green_b[:, n_ob : n_ob + trial_data.nvir[1]].copy()
+    greenp_a = _greenp_from_active(green_occ_a, trial_data.norb)
+    greenp_b = _greenp_from_active(green_occ_b, trial_data.norb)
 
     chol_a = ham_data.chol
     chol_b = meas_ctx.chol_b
@@ -277,7 +276,6 @@ def force_bias_kernel_gw_rh(
     c2bb = trial_data.c2bb
     norb = trial_data.norb
     n_oa, n_ob = trial_data.nocc
-    n_va, n_vb = trial_data.nvir
 
     w = _get_generalized_walker_in_alpha_basis(walker, trial_data)
     bra = _build_bra_generalized(trial_data)
@@ -299,18 +297,18 @@ def force_bias_kernel_gw_rh(
     green_ba = green[n_oa:, :norb]
 
     # (2)
-    green_occ_aa = green_aa[:, n_oa:]
+    green_occ_aa = green_aa[:, n_oa : n_oa + trial_data.nvir[0]]
     # (8)
-    green_occ_bb = green_bb[:, n_ob:]
+    green_occ_bb = green_bb[:, n_ob : n_ob + trial_data.nvir[1]]
     # (4)
-    green_occ_ab = green_ab[:, n_ob:]
+    green_occ_ab = green_ab[:, n_ob : n_ob + trial_data.nvir[1]]
     # (6)
-    green_occ_ba = green_ba[:, n_oa:]
+    green_occ_ba = green_ba[:, n_oa : n_oa + trial_data.nvir[0]]
 
-    greenp_aa = jnp.vstack((green_occ_aa, -jnp.eye(n_va)))
-    greenp_bb = jnp.vstack((green_occ_bb, -jnp.eye(n_vb)))
-    greenp_ab = jnp.vstack((green_occ_ab, -jnp.zeros((n_va, n_vb))))
-    greenp_ba = jnp.vstack((green_occ_ba, -jnp.zeros((n_vb, n_va))))
+    greenp_aa = _greenp_from_active(green_occ_aa, norb)
+    greenp_bb = _greenp_from_active(green_occ_bb, norb)
+    greenp_ab = _greenp_from_active(green_occ_ab, norb, diagonal=False)
+    greenp_ba = _greenp_from_active(green_occ_ba, norb, diagonal=False)
 
     chol_aa = ham_data.chol
     chol_bb = meas_ctx.chol_b
@@ -483,7 +481,6 @@ def energy_kernel_uw_rh(
 ) -> jax.Array:
     wa, wb = walker
     n_oa, n_ob = trial_data.nocc
-    n_va, n_vb = trial_data.nvir
     c1a = trial_data.c1a
     c1b = trial_data.c1b
     c2aa = trial_data.c2aa
@@ -500,10 +497,10 @@ def energy_kernel_uw_rh(
     green_a = _half_green_from_overlap_matrix(wa, woa)  # (n_oa, norb)
     green_b = _half_green_from_overlap_matrix(wb, wob)  # (n_ob, norb)
 
-    green_occ_a = green_a[:, n_oa:].copy()
-    green_occ_b = green_b[:, n_ob:].copy()
-    greenp_a = jnp.vstack((green_occ_a, -jnp.eye(n_va)))
-    greenp_b = jnp.vstack((green_occ_b, -jnp.eye(n_vb)))
+    green_occ_a = green_a[:, n_oa : n_oa + trial_data.nvir[0]].copy()
+    green_occ_b = green_b[:, n_ob : n_ob + trial_data.nvir[1]].copy()
+    greenp_a = _greenp_from_active(green_occ_a, trial_data.norb)
+    greenp_b = _greenp_from_active(green_occ_b, trial_data.norb)
 
     lci1_a = meas_ctx.lci1_a
     lci1_b = meas_ctx.lci1_b
@@ -781,20 +778,20 @@ def energy_kernel_gw_rh(
     green_ba = green[n_oa:, :norb]
 
     # (2)
-    green_occ_aa = green_aa[:, n_oa:]
+    green_occ_aa = green_aa[:, n_oa : n_oa + trial_data.nvir[0]]
     # (8)
-    green_occ_bb = green_bb[:, n_ob:]
+    green_occ_bb = green_bb[:, n_ob : n_ob + trial_data.nvir[1]]
     # (4)
-    green_occ_ab = green_ab[:, n_ob:]
+    green_occ_ab = green_ab[:, n_ob : n_ob + trial_data.nvir[1]]
     # (6)
-    green_occ_ba = green_ba[:, n_oa:]
+    green_occ_ba = green_ba[:, n_oa : n_oa + trial_data.nvir[0]]
 
     green_occ = jnp.block([[green_occ_aa, green_occ_ab], [green_occ_ba, green_occ_bb]])
 
-    greenp_aa = jnp.vstack((green_occ_aa, -jnp.eye(n_va)))
-    greenp_bb = jnp.vstack((green_occ_bb, -jnp.eye(n_vb)))
-    greenp_ab = jnp.vstack((green_occ_ab, -jnp.zeros((n_va, n_vb))))
-    greenp_ba = jnp.vstack((green_occ_ba, -jnp.zeros((n_vb, n_va))))
+    greenp_aa = _greenp_from_active(green_occ_aa, norb)
+    greenp_bb = _greenp_from_active(green_occ_bb, norb)
+    greenp_ab = _greenp_from_active(green_occ_ab, norb, diagonal=False)
+    greenp_ba = _greenp_from_active(green_occ_ba, norb, diagonal=False)
 
     greenp = jnp.block([[greenp_aa, greenp_ab], [greenp_ba, greenp_bb]])
 
@@ -1231,6 +1228,20 @@ def energy_kernel_gw_rh(
     return e + e0
 
 
+def _greenp_from_active(green_occ: jax.Array, norb: int, *, diagonal: bool = True) -> jax.Array:
+    """Full orbital rows and only retained virtual columns of G - I.
+
+    For spin-off-diagonal Green blocks there is no identity contribution.
+    Discarded virtual rows are zero for the HF reference, not removed from H.
+    """
+    nocc, nvir = green_occ.shape
+    if diagonal:
+        virtual_rows = -jnp.eye(norb - nocc, nvir, dtype=green_occ.dtype)
+    else:
+        virtual_rows = jnp.zeros((norb - nocc, nvir), dtype=green_occ.dtype)
+    return jnp.concatenate((green_occ, virtual_rows), axis=0)
+
+
 def build_meas_ctx(
     ham_data: HamChol, trial_data: UcisdTrial, cfg: UcisdMeasCfg = UcisdMeasCfg()
 ) -> UcisdMeasCtx:
@@ -1250,13 +1261,13 @@ def build_meas_ctx(
 
     lci1_a = jnp.einsum(
         "git,pt->gip",
-        ham_data.chol[:, :, n_oa:],
+        ham_data.chol[:, :, n_oa : n_oa + trial_data.nvir[0]],
         trial_data.c1a,
         optimize="optimal",
     )
     lci1_b = jnp.einsum(
         "git,pt->gip",
-        chol_b[:, :, n_ob:],
+        chol_b[:, :, n_ob : n_ob + trial_data.nvir[1]],
         trial_data.c1b,
         optimize="optimal",
     )

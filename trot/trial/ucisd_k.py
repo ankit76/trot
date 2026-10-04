@@ -219,8 +219,8 @@ def overlap_r(walker: jax.Array, trial_data: UcisdKTrial) -> jax.Array:
     """Exact overlap for a restricted walker and combined-K UCISD trial."""
     green_a, green_b, det0 = _greens_restricted(walker, trial_data)
     noa, nob = trial_data.nocc
-    green_occ_a = green_a[:, noa:]
-    green_occ_b = green_b[:, nob:]
+    green_occ_a = green_a[:, noa : noa + trial_data.nvir[0]]
+    green_occ_b = green_b[:, nob : nob + trial_data.nvir[1]]
     singles = jnp.einsum("ia,ia->", trial_data.c1a, green_occ_a, optimize="optimal")
     singles += jnp.einsum("ia,ia->", trial_data.c1b, green_occ_b, optimize="optimal")
     doubles = k_quadratic(trial_data, green_occ_a, green_occ_b)

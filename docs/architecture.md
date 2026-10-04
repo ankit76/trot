@@ -406,6 +406,57 @@ mean, err = afqmc.kernel()
 Key attributes: `walker_kind`, `mixed_precision`, `staged`, `job`, `e_tot`,
 `e_err`.
 
+#### Spin-specific trial FNO spaces
+
+UCISD and PT2-UCCSD support compact, separately retained alpha and beta
+virtual spaces, including unequal retained counts. This is **trial-only FNO**:
+the full spatial Hamiltonian and walker dimension remain unchanged apart from
+physical frozen-core removal. A full orbital rotation puts the Hamiltonian in
+the alpha FNO basis; the full beta-to-alpha rotation is kept with the trial.
+Restricted walkers remain supported.
+
+PySCF input preparation can use its existing UMP2 FNO routine:
+
+```python
+from pyscf import mp, cc
+from trot.staging import stage
+
+ncore = 2  # Physical core frozen in both CC and AFQMC.
+fno_threshold = 1.0e-3
+ump2 = mp.UMP2(mf, frozen=ncore).run()  # mf is an already converged UHF object.
+frozen, mo_fno = ump2.make_fno(thresh=fno_threshold)
+mycc = cc.UCCSD(mf, frozen=frozen, mo_coeff=mo_fno)
+mycc.verbose = 5
+mycc.kernel()
+staged = stage(mycc, norb_frozen_core=ncore, cache="trial_fno.h5")
+```
+
+The full MO coefficient matrices must retain the discarded columns, ordered
+`[core | occupied | retained virtual | discarded virtual]` separately for each
+spin, as returned by `make_fno`. Staging accepts PySCF's two frozen-index lists
+and preserves them in the archive. The occupied frozen prefixes must match the
+explicit common AFQMC frozen-core count; trial-only occupied freezing is not
+implemented for unrestricted trials.
+
+Dense UCISD, combined-K and spin-block modes, and dense/mode PT2-UCCSD use
+compact excitation dimensions. For retained counts $v_\alpha$ and $v_\beta$,
+the combined mode pair dimension is $o_\alpha v_\alpha + o_\beta v_\beta$;
+amplitudes are not padded to the full virtual space. Green-function and
+Hamiltonian contractions keep full orbital rows and only the retained trial
+virtual columns where appropriate. Dense Cholesky batching and mode pair
+sampling use the same compact spaces.
+
+For low-level PT2-UCCSD construction, supply the compact raw `t1a`, `t1b`,
+`t2aa`, `t2ab`, `t2bb` amplitudes and the **full** `mo_coeff_b` from the staged
+UCISD trial to `make_ptuccsd_thouless_trial_data` or
+`make_ptuccsd_thouless_mode_trial_data` (`t2_layout="pyscf"` for PySCF arrays).
+These factories infer retained dimensions and build full-row Thouless
+reference matrices. Serialized precomputed PT modes without amplitudes must
+also retain `nvir_t_outer=(discarded_alpha, discarded_beta)`; legacy mode data
+defaults to `(0, 0)`. UCISD mode caches infer the retained dimensions from the
+stored singles arrays. FNO selection is independent of eigenmode compression;
+neither precision defaults nor sampling policies are changed by using FNO.
+
 #### Retained-mode CISD/UCISD trials
 
 The opt-in CISD workflow is configured as one nested object rather than a

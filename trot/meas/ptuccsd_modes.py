@@ -427,10 +427,10 @@ def _half_green_blocks(
     green_a = trial_data.mo_t_a.conj() @ half_green_a
     green_b = trial_data.mo_t_b.conj() @ half_green_b
     noa, nob = trial_data.nocc
-    green_occ_a = green_a[:noa, noa:]
-    green_occ_b = green_b[:nob, nob:]
-    greenp_a = greenp_from_green(green_a, noa)
-    greenp_b = greenp_from_green(green_b, nob)
+    green_occ_a = green_a[:noa, noa : noa + trial_data.nvir[0]]
+    green_occ_b = green_b[:nob, nob : nob + trial_data.nvir[1]]
+    greenp_a = greenp_from_green(green_a, noa, trial_data.nvir[0])
+    greenp_b = greenp_from_green(green_b, nob, trial_data.nvir[1])
     return (
         half_green_a,
         half_green_b,
@@ -468,15 +468,15 @@ def _force_bias_half_green_blocks(
 
     green_rows_a = trial_data.mo_t_a.conj()[:noa, :] @ half_green_a
     green_rows_b = trial_data.mo_t_b.conj()[:nob, :] @ half_green_b
-    green_occ_a = green_rows_a[:, noa:]
-    green_occ_b = green_rows_b[:, nob:]
+    green_occ_a = green_rows_a[:, noa : noa + trial_data.nvir[0]]
+    green_occ_b = green_rows_b[:, nob : nob + trial_data.nvir[1]]
 
-    greenp_a = trial_data.mo_t_a.conj() @ half_green_a[:, noa:]
-    greenp_b = trial_data.mo_t_b.conj() @ half_green_b[:, nob:]
-    greenp_a = greenp_a.at[noa:, :].add(
+    greenp_a = trial_data.mo_t_a.conj() @ half_green_a[:, noa : noa + trial_data.nvir[0]]
+    greenp_b = trial_data.mo_t_b.conj() @ half_green_b[:, nob : nob + trial_data.nvir[1]]
+    greenp_a = greenp_a.at[noa : noa + trial_data.nvir[0], :].add(
         -jnp.eye(trial_data.nvir[0], dtype=greenp_a.dtype)
     )
-    greenp_b = greenp_b.at[nob:, :].add(
+    greenp_b = greenp_b.at[nob : nob + trial_data.nvir[1], :].add(
         -jnp.eye(trial_data.nvir[1], dtype=greenp_b.dtype)
     )
     return (

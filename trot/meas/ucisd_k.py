@@ -15,7 +15,7 @@ from ..ham.chol import HamChol
 from ..trial.ucisd import UcisdTrial
 from ..trial.ucisd_k import UcisdKTrial
 from ..trial.ucisd_k import overlap_r as ucisd_k_overlap_r
-from .ucisd import UcisdMeasCfg, UcisdMeasCtx
+from .ucisd import UcisdMeasCfg, UcisdMeasCtx, _greenp_from_active
 from .ucisd import build_meas_ctx as build_dense_meas_ctx
 from .ucisd_modes import (
     _chol_contract,
@@ -88,15 +88,14 @@ def _greens_restricted(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Build alpha/beta Green functions from one shared restricted walker."""
     noa, nob = trial_data.nocc
-    nva, nvb = trial_data.nvir
     wa = walker[:, :noa]
     wb = trial_data.mo_coeff_b.T @ walker[:, :nob]
     green_a = jnp.linalg.solve(wa[:noa].T, wa.T)
     green_b = jnp.linalg.solve(wb[:nob].T, wb.T)
-    green_occ_a = green_a[:, noa:]
-    green_occ_b = green_b[:, nob:]
-    greenp_a = jnp.vstack((green_occ_a, -jnp.eye(nva, dtype=green_a.dtype)))
-    greenp_b = jnp.vstack((green_occ_b, -jnp.eye(nvb, dtype=green_b.dtype)))
+    green_occ_a = green_a[:, noa : noa + trial_data.nvir[0]]
+    green_occ_b = green_b[:, nob : nob + trial_data.nvir[1]]
+    greenp_a = _greenp_from_active(green_occ_a, trial_data.norb)
+    greenp_b = _greenp_from_active(green_occ_b, trial_data.norb)
     return green_a, green_b, greenp_a, greenp_b
 
 
@@ -255,8 +254,8 @@ def _force_bias_kernel_rw_rh_with_apply(
     base = meas_ctx.base
     green_a, green_b, greenp_a, greenp_b = _greens_restricted(walker, trial_data)
     noa, nob = trial_data.nocc
-    green_occ_a = green_a[:, noa:]
-    green_occ_b = green_b[:, nob:]
+    green_occ_a = green_a[:, noa : noa + trial_data.nvir[0]]
+    green_occ_b = green_b[:, nob : nob + trial_data.nvir[1]]
 
     lg_a = jnp.einsum("gpj,pj->g", base.rot_chol_a, green_a, optimize="optimal")
     lg_b = jnp.einsum("gpj,pj->g", base.rot_chol_b, green_b, optimize="optimal")
@@ -313,8 +312,8 @@ def _ucisd_k_energy_common(
     base = meas_ctx.base
     green_a, green_b, greenp_a, greenp_b = _greens_restricted(walker, trial_data)
     noa, nob = trial_data.nocc
-    green_occ_a = green_a[:, noa:]
-    green_occ_b = green_b[:, nob:]
+    green_occ_a = green_a[:, noa : noa + trial_data.nvir[0]]
+    green_occ_b = green_b[:, nob : nob + trial_data.nvir[1]]
     h1_a = 0.5 * (ham_data.h1 + ham_data.h1.T)
     h1_b = base.h1_b
 

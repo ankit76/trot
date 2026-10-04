@@ -219,6 +219,8 @@ class PtuccsdThoulessModeTrial:
     The modes may mix alpha and beta pair spaces.  The spin-dependent Thouless
     references and orbital bases remain explicit, while restricted walkers
     continue to share their first ``min(n_alpha, n_beta)`` occupied columns.
+    ``nvir_t_outer`` counts trailing virtual orbitals excluded from each spin
+    trial, but retained in the full Hamiltonian and reference matrices.
     """
 
     mo_t_a: jax.Array
@@ -226,6 +228,7 @@ class PtuccsdThoulessModeTrial:
     mo_coeff_b: jax.Array
     eigenvalues: jax.Array
     modes: jax.Array
+    nvir_t_outer: tuple[int, int] = (0, 0)
 
     def __post_init__(self) -> None:
         arrays = (
@@ -255,6 +258,14 @@ class PtuccsdThoulessModeTrial:
             )
         if self.modes.ndim != 2:
             raise ValueError(f"modes must have rank 2, got shape {self.modes.shape}.")
+        if (
+            len(self.nvir_t_outer) != 2
+            or any(x < 0 for x in self.nvir_t_outer)
+            or min(self.nvir) < 0
+        ):
+            raise ValueError(
+                "nvir_t_outer must give valid discarded virtual counts for both spins."
+            )
         expected = (self.mode_rank, sum(self.pair_dim))
         if self.modes.shape != expected:
             raise ValueError(f"modes must have shape {expected}, got {self.modes.shape}.")
@@ -272,7 +283,7 @@ class PtuccsdThoulessModeTrial:
     @property
     def nvir(self) -> tuple[int, int]:
         noa, nob = self.nocc
-        return (self.norb - noa, self.norb - nob)
+        return (self.norb - noa - self.nvir_t_outer[0], self.norb - nob - self.nvir_t_outer[1])
 
     @property
     def pair_dim(self) -> tuple[int, int]:
@@ -292,12 +303,11 @@ class PtuccsdThoulessModeTrial:
             self.mo_coeff_b,
             self.eigenvalues,
             self.modes,
-        ), None
+        ), self.nvir_t_outer
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        del aux
-        return cls(*children)
+        return cls(*children, nvir_t_outer=aux)
 
 
 def mode_projections(
@@ -409,6 +419,7 @@ def _spin_green(walker: jax.Array, mo_t: jax.Array) -> jax.Array:
 def _spin_overlap_and_green_occ(
     walker: jax.Array,
     mo_t: jax.Array,
+    nvir: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Return the determinant overlap and occupied--virtual Green block.
 
@@ -420,7 +431,8 @@ def _spin_overlap_and_green_occ(
     overlap_matrix = mo_t.conj().T @ walker
     half_green = jnp.linalg.solve(overlap_matrix.T, walker.T)
     nocc = int(mo_t.shape[1])
-    green_occ = mo_t.conj()[:nocc, :] @ half_green[:, nocc:]
+    stop = mo_t.shape[0] if nvir is None else nocc + nvir
+    green_occ = mo_t.conj()[:nocc, :] @ half_green[:, nocc:stop]
     return jnp.linalg.det(overlap_matrix), green_occ
 
 
@@ -444,8 +456,8 @@ def theta_t2_from_greens(
     noa, nob = trial_data.nocc
     return mode_quadratic(
         trial_data,
-        green_a[:noa, noa:],
-        green_b[:nob, nob:],
+        green_a[:noa, noa : noa + trial_data.nvir[0]],
+        green_b[:nob, nob : nob + trial_data.nvir[1]],
     )
 
 
@@ -455,8 +467,10 @@ def theta_t2_u(
 ) -> jax.Array:
     walker_a, walker_b = walker
     walker_b_beta = trial_data.mo_coeff_b.conj().T @ walker_b
-    _, green_occ_a = _spin_overlap_and_green_occ(walker_a, trial_data.mo_t_a)
-    _, green_occ_b = _spin_overlap_and_green_occ(walker_b_beta, trial_data.mo_t_b)
+    _, green_occ_a = _spin_overlap_and_green_occ(walker_a, trial_data.mo_t_a, trial_data.nvir[0])
+    _, green_occ_b = _spin_overlap_and_green_occ(
+        walker_b_beta, trial_data.mo_t_b, trial_data.nvir[1]
+    )
     return mode_quadratic(trial_data, green_occ_a, green_occ_b)
 
 
@@ -480,10 +494,12 @@ def overlap_u(
     overlap_a, green_occ_a = _spin_overlap_and_green_occ(
         walker_a,
         trial_data.mo_t_a,
+        trial_data.nvir[0],
     )
     overlap_b, green_occ_b = _spin_overlap_and_green_occ(
         walker_b_beta,
         trial_data.mo_t_b,
+        trial_data.nvir[1],
     )
     theta = mode_quadratic(trial_data, green_occ_a, green_occ_b)
     return overlap_a * overlap_b * jnp.exp(theta)
@@ -543,24 +559,43 @@ def make_ptuccsd_thouless_mode_trial_data(
     blocks are factorized on the host and are not retained by the trial.
     """
 
+    mo_coeff_b_raw = data.get("mo_coeff_b", data.get("mo_b"))
+    if mo_coeff_b_raw is None:
+        raise KeyError("PT-UCCSD trial data requires 'mo_coeff_b' or 'mo_b'.")
+    mo_coeff_b_raw = jnp.asarray(mo_coeff_b_raw)
+    norb = int(mo_coeff_b_raw.shape[0])
+
     mo_t_a = (
         jnp.asarray(data["mo_t_a"])
         if "mo_t_a" in data
-        else thouless_mo_from_t1(jnp.asarray(data["t1a"]))
+        else thouless_mo_from_t1(jnp.asarray(data["t1a"]), norb)
     )
     mo_t_b = (
         jnp.asarray(data["mo_t_b"])
         if "mo_t_b" in data
-        else thouless_mo_from_t1(jnp.asarray(data["t1b"]))
+        else thouless_mo_from_t1(jnp.asarray(data["t1b"]), norb)
     )
-    mo_coeff_b_raw = data.get("mo_coeff_b", data.get("mo_b"))
-    if mo_coeff_b_raw is None:
-        raise KeyError("PT-UCCSD mode trial data requires 'mo_coeff_b' or 'mo_b'.")
 
     noa = int(mo_t_a.shape[1])
     nob = int(mo_t_b.shape[1])
     norb = int(mo_t_a.shape[0])
-    combined_dim = noa * (norb - noa) + nob * (norb - nob)
+    if "nvir_t_outer" in data:
+        nvir_t_outer = tuple(int(x) for x in data["nvir_t_outer"])
+    elif "t1a" in data and "t1b" in data:
+        nvir_t_outer = (
+            norb - noa - np.shape(data["t1a"])[1],
+            norb - nob - np.shape(data["t1b"])[1],
+        )
+    elif "t2aa" in data and "t2bb" in data:
+        virtual_axis = 1 if str(data.get("t2_layout", "pyscf")).lower() == "iajb" else 2
+        nvir_t_outer = (
+            norb - noa - np.shape(data["t2aa"])[virtual_axis],
+            norb - nob - np.shape(data["t2bb"])[virtual_axis],
+        )
+    else:
+        # Legacy precomputed modes use all virtual orbitals.
+        nvir_t_outer = (0, 0)
+    combined_dim = noa * (norb - noa - nvir_t_outer[0]) + nob * (norb - nob - nvir_t_outer[1])
     if "eigenvalues" in data:
         eigenvalues_raw = np.asarray(data["eigenvalues"])
         if np.iscomplexobj(eigenvalues_raw):
@@ -611,6 +646,7 @@ def make_ptuccsd_thouless_mode_trial_data(
         mo_coeff_b=jnp.asarray(mo_coeff_b_raw),
         eigenvalues=jnp.asarray(eigenvalues, dtype=jnp.float64),
         modes=jnp.asarray(modes, dtype=mode_dtype),
+        nvir_t_outer=nvir_t_outer,
     )
     if sys is not None:
         if trial_data.norb != sys.norb:

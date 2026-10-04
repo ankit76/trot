@@ -595,8 +595,8 @@ def overlap_r(walker: jax.Array, trial_data: UcisdKModeTrial) -> jax.Array:
     """Overlap for a restricted walker and retained combined-K modes."""
     green_a, green_b, det0 = _greens_restricted(walker, trial_data)
     noa, nob = trial_data.nocc
-    green_occ_a = green_a[:, noa:]
-    green_occ_b = green_b[:, nob:]
+    green_occ_a = green_a[:, noa : noa + trial_data.nvir[0]]
+    green_occ_b = green_b[:, nob : nob + trial_data.nvir[1]]
     singles = jnp.einsum("ia,ia->", trial_data.c1a, green_occ_a, optimize="optimal")
     singles += jnp.einsum("ia,ia->", trial_data.c1b, green_occ_b, optimize="optimal")
     doubles = k_mode_quadratic(trial_data, green_occ_a, green_occ_b)
