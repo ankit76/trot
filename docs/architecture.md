@@ -91,6 +91,17 @@ supplying nonsymmetric real factors must use this override. Low-level
 at setup. Device setup and HF/dense-CISD host setup use the same policy.
 Measurement storage and the staging archive format are unchanged.
 
+Dense restricted PT2-CCSD energy measurement honors `mixed_precision=True`
+for its expensive two-body doubles contractions. It retains the input precision
+for Green functions, Green/Cholesky products, HF exchange, the overlap component,
+one-body terms, Coulomb dots, scalar reductions, and the final connected-energy
+subtraction. For double-precision inputs these retained operations use
+FP64/complex128; the large T2 products use FP32/complex64 with the matrix-product
+policy. Cholesky vectors are processed individually without converting the
+entire real factor tensor to complex. `mixed_precision=False` preserves the
+original full-precision kernel. This does not change the estimator, trial
+representation, sampling, or precision defaults.
+
 A simulation has three stages: **staging**, **job assembly**, and
 **QMC execution**.
 

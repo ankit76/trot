@@ -21,6 +21,11 @@ class FpCholAfqmcCtx:
     chol_flat: jax.Array  # (n_fields, n*n)
     norb: int
 
+    @property
+    def chol_packed(self) -> bool:
+        """Free projection stores full factors for the shared Trotter kernel."""
+        return False
+
     def tree_flatten(self):
         return (
             self.dt,

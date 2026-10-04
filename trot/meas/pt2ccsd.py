@@ -58,6 +58,65 @@ def _greenp_from_green(green: jax.Array, nocc: int) -> jax.Array:
     return (green - jnp.eye(norb))[:, nocc:]
 
 
+def _mixed_t2_contract(subscripts: str, t2: jax.Array, x: jax.Array) -> jax.Array:
+    # Do not promote the entire real doubles tensor to complex.
+    if not jnp.iscomplexobj(t2) and jnp.iscomplexobj(x):
+        return jnp.einsum(subscripts, t2, x.real, optimize="optimal") + 1j * jnp.einsum(
+            subscripts, t2, x.imag, optimize="optimal"
+        )
+    return jnp.einsum(subscripts, t2, x, optimize="optimal")
+
+
+def _two_body_mixed(
+    green: jax.Array,
+    greenp: jax.Array,
+    t2_green: jax.Array,
+    t2: jax.Array,
+    chol: jax.Array,
+    cfg: Pt2ccsdMeasCfg,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Mixed-precision doubles products with full-precision remaining terms.
+
+    Preserve the Green/Cholesky products and HF exchange in input precision;
+    reducing their precision can produce millihartree errors on GPU defaults.
+    Only the large T2 applications use the configured working dtypes. Coulomb
+    dots are evaluated inside the existing Cholesky scan, avoiding a full
+    complex Cholesky copy. All scalar reductions retain input precision.
+    """
+    nocc = t2.shape[0]
+    dtype_acc = jnp.result_type(green, t2, chol)
+
+    def working(array):
+        dtype = cfg.mixed_complex_dtype if jnp.iscomplexobj(array) else cfg.mixed_real_dtype
+        return array.astype(dtype)
+
+    t2_work = working(t2)
+    zero = jnp.zeros((), dtype=dtype_acc)
+
+    def scanned_fun(carry, chol_i):
+        gl = jnp.einsum("pr,qr->pq", green, chol_i, optimize="optimal")
+        lt2g = jnp.einsum("pr,qr->pq", chol_i, t2_green, optimize="optimal")
+        # Full-precision dots are cheap relative to the dense matrix products.
+        lg = jnp.sum(chol_i * green, dtype=dtype_acc)
+        lt2g_dot = jnp.sum(chol_i * t2_green, dtype=dtype_acc)
+        e20 = 2 * lg * lg - jnp.sum(gl * gl.T, dtype=dtype_acc)
+        e221 = -lt2g_dot * lg
+        e222 = 0.5 * jnp.sum(gl * lt2g, dtype=dtype_acc)
+        x = jnp.einsum("iq,qa->ia", gl[:nocc], greenp, optimize="optimal")
+        x_work = working(x)
+        tc = _mixed_t2_contract("iajb,jb->ia", t2_work, x_work)
+        te = _mixed_t2_contract("iajb,ja->ib", t2_work, x_work)
+        x_acc = x.astype(dtype_acc)
+        direct = jnp.sum(x_acc * tc.astype(dtype_acc), dtype=dtype_acc)
+        exchange = jnp.sum(x_acc * te.astype(dtype_acc), dtype=dtype_acc)
+        e23 = 2 * direct - exchange
+        values = (e20, e221, e222, e23)
+        return tuple(old + value for old, value in zip(carry, values)), None
+
+    values, _ = lax.scan(scanned_fun, (zero, zero, zero, zero), chol)
+    return values
+
+
 def energy_kernel_rw_rh(
     walker: jax.Array, ham_data: HamChol, meas_ctx: Pt2ccsdMeasCtx, trial_data: Pt2ccsdTrial
 ) -> jax.Array:
@@ -85,31 +144,38 @@ def energy_kernel_rw_rh(
     e1_2_2 = -2 * jnp.einsum("pq,pq->", h1, t2_green, optimize="optimal")
     e1_2 = e1_2_1 + e1_2_2  # <exp(T1)HF|T2 h1|walker>/<exp(T1)HF|walker>
 
-    # two body energy
-    lg = jnp.einsum("gpq,pq->g", chol, green, optimize="optimal")
+    # Only the expensive two-body doubles products change precision. Other
+    # terms, including HF exchange and theta, retain their input precision.
+    if meas_ctx.cfg.mixed_real_dtype == jnp.float32:
+        e2_0, e2_2_2_1, e2_2_2_2, e2_2_3 = _two_body_mixed(
+            green, greenp, t2_green, t2, chol, meas_ctx.cfg
+        )
+    else:
+        # two body energy
+        lg = jnp.einsum("gpq,pq->g", chol, green, optimize="optimal")
 
-    # two body double excitations
-    lt2g = jnp.einsum("gpq,pq->g", chol, t2_green, optimize="optimal")
-    e2_2_2_1 = -lt2g @ lg
+        # two body double excitations
+        lt2g = jnp.einsum("gpq,pq->g", chol, t2_green, optimize="optimal")
+        e2_2_2_1 = -lt2g @ lg
 
-    def scanned_fun(carry, x):
-        chol_i = x
-        # e2_0
-        gl_i = jnp.einsum("pr,qr->pq", green, chol_i, optimize="optimal")
-        e2_0_1_i = (2 * jnp.trace(gl_i)) ** 2 / 2.0
-        e2_0_2_i = -jnp.einsum("pq,qp->", gl_i, gl_i, optimize="optimal")
-        carry[0] += e2_0_1_i + e2_0_2_i
-        # e2_2_2_2
-        lt2_green_i = jnp.einsum("pr,qr->pq", chol_i, t2_green, optimize="optimal")
-        carry[1] += 0.5 * jnp.einsum("pq,pq->", gl_i, lt2_green_i, optimize="optimal")
-        # e2_2_3
-        glgp_i = jnp.einsum("iq,qa->ia", gl_i[:nocc, :], greenp, optimize="optimal")
-        l2t2_1 = jnp.einsum("ia,jb,iajb->", glgp_i, glgp_i, t2, optimize="optimal")
-        l2t2_2 = jnp.einsum("ib,ja,iajb->", glgp_i, glgp_i, t2, optimize="optimal")
-        carry[2] += 2 * l2t2_1 - l2t2_2
-        return carry, 0.0
+        def scanned_fun(carry, x):
+            chol_i = x
+            # e2_0
+            gl_i = jnp.einsum("pr,qr->pq", green, chol_i, optimize="optimal")
+            e2_0_1_i = (2 * jnp.trace(gl_i)) ** 2 / 2.0
+            e2_0_2_i = -jnp.einsum("pq,qp->", gl_i, gl_i, optimize="optimal")
+            carry[0] += e2_0_1_i + e2_0_2_i
+            # e2_2_2_2
+            lt2_green_i = jnp.einsum("pr,qr->pq", chol_i, t2_green, optimize="optimal")
+            carry[1] += 0.5 * jnp.einsum("pq,pq->", gl_i, lt2_green_i, optimize="optimal")
+            # e2_2_3
+            glgp_i = jnp.einsum("iq,qa->ia", gl_i[:nocc, :], greenp, optimize="optimal")
+            l2t2_1 = jnp.einsum("ia,jb,iajb->", glgp_i, glgp_i, t2, optimize="optimal")
+            l2t2_2 = jnp.einsum("ib,ja,iajb->", glgp_i, glgp_i, t2, optimize="optimal")
+            carry[2] += 2 * l2t2_1 - l2t2_2
+            return carry, 0.0
 
-    [e2_0, e2_2_2_2, e2_2_3], _ = lax.scan(scanned_fun, [0.0, 0.0, 0.0], chol)
+        [e2_0, e2_2_2_2, e2_2_3], _ = lax.scan(scanned_fun, [0.0, 0.0, 0.0], chol)
     e2_2_1 = e2_0 * gt2g
     e2_2_2 = 4 * (e2_2_2_1 + e2_2_2_2)
     e2_2 = e2_2_1 + e2_2_2 + e2_2_3
