@@ -115,6 +115,18 @@ full complex Cholesky copy. Both settings work with walker chunking.
 The dense kernel retains its existing transpose convention. This does not
 change the estimator, trial representation, sampling, or precision defaults.
 
+Dense UCISD and PT2-UCCSD measurements likewise accept
+`memory_mode="low", chol_batch_size=64` for restricted/unrestricted walkers.
+This batches the large doubles contractions in groups of Cholesky vectors,
+using the same arithmetic and precision policy as their high-memory path;
+only the final partial group is zero-padded. The factories still default to
+`memory_mode="high"` (all vectors together). `chol_batch_size=1` selects a
+single-vector batch. Other two-body intermediates and stored Hamiltonian
+tensors retain their existing layouts. This is compatible with walker
+chunking. UCISD's generalized-walker kernel is unchanged. Configure this via
+`make_ucisd_meas_ops` or `make_pt2uccsd_estimator_ops` (also supported by
+`make_pt2uccsd_meas_ops`); no new staging or high-level AFQMC option is needed.
+
 A simulation has three stages: **staging**, **job assembly**, and
 **QMC execution**.
 

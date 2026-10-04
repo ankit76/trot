@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Literal
 
 import jax
@@ -29,10 +30,13 @@ class PtuccsdThoulessMeasCfg:
     mixed_complex_dtype: jnp.dtype = jnp.complex128
     mixed_real_dtype_testing: jnp.dtype = jnp.float32
     mixed_complex_dtype_testing: jnp.dtype = jnp.complex64
+    chol_batch_size: int = 64  # vectors per doubles contraction in low-memory mode
 
     def __post_init__(self) -> None:
         if self.memory_mode not in {"low", "high"}:
             raise ValueError("memory_mode must be 'low' or 'high'.")
+        if not isinstance(self.chol_batch_size, Integral) or self.chol_batch_size < 1:
+            raise ValueError("chol_batch_size must be a positive integer.")
 
 
 @tree_util.register_pytree_node_class
@@ -537,69 +541,8 @@ def _energy_components_uw_rh(
     greenp_b_mixed = greenp_b.astype(cfg.mixed_complex_dtype)
     combo2_a_mixed = combo2_a.astype(cfg.mixed_complex_dtype)
     combo2_b_mixed = combo2_b.astype(cfg.mixed_complex_dtype)
-    if cfg.memory_mode == "low":
-        zero_e222 = jnp.zeros_like(e2_2_2_1)
-        zero_e23 = jnp.array(0.0, dtype=cfg.mixed_complex_dtype_testing)
 
-        def scan_doubles(carry, xs):
-            e222_acc, e23_acc = carry
-            chol_a_i, rot_chol_a_i, chol_b_i, rot_chol_b_i = xs
-            gl_half_a_i = _energy_gl_scalar(half_green_a, chol_a_i, cfg)
-            gl_half_b_i = _energy_gl_scalar(half_green_b, chol_b_i, cfg)
-            lcombo_a_i = jnp.einsum(
-                "pi,ji->pj",
-                rot_chol_a_i.astype(cfg.mixed_complex_dtype),
-                combo2_a_mixed,
-                optimize="optimal",
-            )
-            lcombo_b_i = jnp.einsum(
-                "pi,ji->pj",
-                rot_chol_b_i.astype(cfg.mixed_complex_dtype),
-                combo2_b_mixed,
-                optimize="optimal",
-            )
-            e222_acc += 0.5 * (
-                jnp.einsum("pi,pi->", gl_half_a_i, lcombo_a_i, optimize="optimal")
-                + jnp.einsum("pi,pi->", gl_half_b_i, lcombo_b_i, optimize="optimal")
-            )
-
-            gl_occ_a_i = reference_occ_a @ gl_half_a_i
-            gl_occ_b_i = reference_occ_b @ gl_half_b_i
-            glgp_a_i = jnp.einsum(
-                "pi,it->pt", gl_occ_a_i, greenp_a_mixed, optimize="optimal"
-            ).astype(cfg.mixed_complex_dtype_testing)
-            glgp_b_i = jnp.einsum(
-                "pi,it->pt", gl_occ_b_i, greenp_b_mixed, optimize="optimal"
-            ).astype(cfg.mixed_complex_dtype_testing)
-            l2t2_a = 0.5 * jnp.einsum(
-                "pt,qu,ptqu->",
-                glgp_a_i,
-                glgp_a_i,
-                t2aa.astype(cfg.mixed_real_dtype_testing),
-                optimize="optimal",
-            )
-            l2t2_b = 0.5 * jnp.einsum(
-                "pt,qu,ptqu->",
-                glgp_b_i,
-                glgp_b_i,
-                t2bb.astype(cfg.mixed_real_dtype_testing),
-                optimize="optimal",
-            )
-            l2t2_ab = jnp.einsum(
-                "pt,qu,ptqu->",
-                glgp_a_i,
-                glgp_b_i,
-                t2ab.astype(cfg.mixed_real_dtype_testing),
-                optimize="optimal",
-            )
-            return (e222_acc, e23_acc + l2t2_a + l2t2_b + l2t2_ab), None
-
-        (e2_2_2_2, e2_2_3), _ = jax.lax.scan(
-            scan_doubles,
-            (zero_e222, zero_e23),
-            (chol_a, rot_chol_a, chol_b, rot_chol_b),
-        )
-    else:
+    def contract_doubles(chol_a, rot_chol_a, chol_b, rot_chol_b):
         gl_half_a = _energy_gl_batched(half_green_a, chol_a, cfg)
         gl_half_b = _energy_gl_batched(half_green_b, chol_b, cfg)
         lcombo_a = jnp.einsum(
@@ -653,6 +596,37 @@ def _energy_components_uw_rh(
             optimize="optimal",
         )
         e2_2_3 = jnp.sum(l2t2_a + l2t2_b + l2t2_ab)
+        return e2_2_2_2, e2_2_3
+
+    nchol = chol_a.shape[0]
+    chol_tensors = (chol_a, rot_chol_a, chol_b, rot_chol_b)
+    if cfg.memory_mode == "high" or nchol <= cfg.chol_batch_size:
+        e2_2_2_2, e2_2_3 = contract_doubles(*chol_tensors)
+    else:
+        batch_size = cfg.chol_batch_size
+        nfull, remainder = divmod(nchol, batch_size)
+
+        def accumulate(index, carry):
+            batches = tuple(
+                jax.lax.dynamic_slice_in_dim(tensor, index * batch_size, batch_size, axis=0)
+                for tensor in chol_tensors
+            )
+            values = contract_doubles(*batches)
+            return tuple(old + value for old, value in zip(carry, values))
+
+        zeros = (
+            jnp.zeros_like(e2_2_2_1),
+            jnp.zeros((), dtype=cfg.mixed_complex_dtype_testing),
+        )
+        values = jax.lax.fori_loop(0, nfull, accumulate, zeros)
+        if remainder:
+            # Pad only the final partial batch, never the full Hamiltonian.
+            padding = ((0, batch_size - remainder), (0, 0), (0, 0))
+            tail = contract_doubles(
+                *(jnp.pad(tensor[nfull * batch_size :], padding) for tensor in chol_tensors)
+            )
+            values = tuple(old + value for old, value in zip(values, tail))
+        e2_2_2_2, e2_2_3 = values
 
     e2_2 = e2_0 * theta2 + e2_2_2_1 + e2_2_2_2 + e2_2_3
     h_t = e1_2 + e2_2
@@ -710,9 +684,13 @@ def make_ptuccsd_thouless_meas_ops(
     memory_mode: Literal["low", "high"] = "high",
     mixed_precision: bool = True,
     testing: bool = False,
+    *,
+    chol_batch_size: int = 64,
 ) -> MeasOps:
+    """Dense measurements; low-memory mode batches doubles over Cholesky vectors."""
     cfg = PtuccsdThoulessMeasCfg(
         memory_mode=memory_mode,
+        chol_batch_size=chol_batch_size,
         mixed_real_dtype=jnp.float32 if mixed_precision else jnp.float64,
         mixed_complex_dtype=jnp.complex64 if mixed_precision else jnp.complex128,
         mixed_real_dtype_testing=jnp.float64 if testing else jnp.float32,
@@ -751,13 +729,20 @@ def make_ptuccsd_thouless_estimator_ops(
     memory_mode: Literal["low", "high"] = "high",
     mixed_precision: bool = True,
     testing: bool = False,
+    *,
+    chol_batch_size: int = 64,
 ) -> EstimatorOps:
-    """Build a PT2-UCCSD estimator for a separately chosen propagation guide."""
+    """Build a PT2-UCCSD estimator for a separately chosen propagation guide.
+
+    ``memory_mode="low"`` bounds doubles work to ``chol_batch_size`` vectors;
+    ``"high"`` retains the all-Cholesky contractions.
+    """
     if sys.walker_kind.lower() != "restricted" or sys.nup < sys.ndn:
         raise ValueError("PT2-UCCSD estimators require a restricted walker with nup >= ndn.")
 
     cfg = PtuccsdThoulessMeasCfg(
         memory_mode=memory_mode,
+        chol_batch_size=chol_batch_size,
         mixed_real_dtype=jnp.float32 if mixed_precision else jnp.float64,
         mixed_complex_dtype=jnp.complex64 if mixed_precision else jnp.complex128,
         mixed_real_dtype_testing=jnp.float64 if testing else jnp.float32,

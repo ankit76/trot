@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +61,13 @@ class UcisdMeasCfg:
     mixed_complex_dtype: jnp.dtype = jnp.complex128
     mixed_real_dtype_testing: jnp.dtype = jnp.float32
     mixed_complex_dtype_testing: jnp.dtype = jnp.complex64
+    chol_batch_size: int = 64  # vectors per doubles contraction in low-memory mode
+
+    def __post_init__(self) -> None:
+        if self.memory_mode not in {"low", "high"}:
+            raise ValueError("memory_mode must be 'low' or 'high'.")
+        if not isinstance(self.chol_batch_size, Integral) or self.chol_batch_size < 1:
+            raise ValueError("chol_batch_size must be a positive integer.")
 
 
 @tree_util.register_pytree_node_class
@@ -635,62 +643,7 @@ def energy_kernel_uw_rh(
     )
     e2_2_2_1 = -((lci2g_a + lci2g_b) @ (lg_a + lg_b)) / 2.0
 
-    if cfg.memory_mode == "low":
-
-        def scan_over_chol(carry, x):
-            chol_a_i, rot_chol_a_i, chol_b_i, rot_chol_b_i = x
-            gl_a_i = jnp.einsum("pj,ji->pi", green_a, chol_a_i, optimize="optimal")
-            gl_b_i = jnp.einsum("pj,ji->pi", green_b, chol_b_i, optimize="optimal")
-            lci2_green_a_i = jnp.einsum(
-                "pi,ji->pj",
-                rot_chol_a_i,
-                8 * ci2_green_a + 2 * ci2_green_ab_a,
-                optimize="optimal",
-            )
-            lci2_green_b_i = jnp.einsum(
-                "pi,ji->pj",
-                rot_chol_b_i,
-                8 * ci2_green_b + 2 * ci2_green_ab_b,
-                optimize="optimal",
-            )
-            carry[0] += 0.5 * (
-                jnp.einsum("pi,pi->", gl_a_i, lci2_green_a_i, optimize="optimal")
-                + jnp.einsum("pi,pi->", gl_b_i, lci2_green_b_i, optimize="optimal")
-            )
-            glgp_a_i = jnp.einsum("pi,it->pt", gl_a_i, greenp_a, optimize="optimal").astype(
-                cfg.mixed_complex_dtype_testing
-            )
-            glgp_b_i = jnp.einsum("pi,it->pt", gl_b_i, greenp_b, optimize="optimal").astype(
-                cfg.mixed_complex_dtype_testing
-            )
-            l2ci2_a = 0.5 * jnp.einsum(
-                "pt,qu,ptqu->",
-                glgp_a_i,
-                glgp_a_i,
-                c2aa.astype(cfg.mixed_real_dtype_testing),
-                optimize="optimal",
-            )
-            l2ci2_b = 0.5 * jnp.einsum(
-                "pt,qu,ptqu->",
-                glgp_b_i,
-                glgp_b_i,
-                c2bb.astype(cfg.mixed_real_dtype_testing),
-                optimize="optimal",
-            )
-            l2c2ab = jnp.einsum(
-                "pt,qu,ptqu->",
-                glgp_a_i,
-                glgp_b_i,
-                c2ab.astype(cfg.mixed_real_dtype_testing),
-                optimize="optimal",
-            )
-            carry[1] += l2ci2_a + l2ci2_b + l2c2ab
-            return carry, 0.0
-
-        [e2_2_2_2, e2_2_3], _ = jax.lax.scan(
-            scan_over_chol, [0.0, 0.0], (chol_a, rot_chol_a, chol_b, rot_chol_b)
-        )
-    else:
+    def contract_doubles(chol_a, rot_chol_a, chol_b, rot_chol_b):
         gl_a = jnp.einsum(
             "pj,gji->gpi",
             green_a.astype(cfg.mixed_complex_dtype),
@@ -747,6 +700,37 @@ def energy_kernel_uw_rh(
             optimize="optimal",
         )
         e2_2_3 = l2ci2_a.sum() + l2ci2_b.sum() + l2c2ab.sum()
+        return e2_2_2_2, e2_2_3
+
+    nchol = chol_a.shape[0]
+    chol_tensors = (chol_a, rot_chol_a, chol_b, rot_chol_b)
+    if cfg.memory_mode == "high" or nchol <= cfg.chol_batch_size:
+        e2_2_2_2, e2_2_3 = contract_doubles(*chol_tensors)
+    else:
+        batch_size = cfg.chol_batch_size
+        nfull, remainder = divmod(nchol, batch_size)
+
+        def accumulate(index, carry):
+            batches = tuple(
+                jax.lax.dynamic_slice_in_dim(tensor, index * batch_size, batch_size, axis=0)
+                for tensor in chol_tensors
+            )
+            values = contract_doubles(*batches)
+            return tuple(old + value for old, value in zip(carry, values))
+
+        zeros = (
+            jnp.zeros_like(e2_2_2_1),
+            jnp.zeros((), dtype=cfg.mixed_complex_dtype_testing),
+        )
+        values = jax.lax.fori_loop(0, nfull, accumulate, zeros)
+        if remainder:
+            # Pad only the final partial batch, never the full Hamiltonian.
+            padding = ((0, batch_size - remainder), (0, 0), (0, 0))
+            tail = contract_doubles(
+                *(jnp.pad(tensor[nfull * batch_size :], padding) for tensor in chol_tensors)
+            )
+            values = tuple(old + value for old, value in zip(values, tail))
+        e2_2_2_2, e2_2_3 = values
 
     e2_2_2 = e2_2_2_1 + e2_2_2_2
     e2_2 = e2_2_1 + e2_2_2 + e2_2_3
@@ -1296,11 +1280,20 @@ def make_ucisd_meas_ops(
     memory_mode: str = "high",
     mixed_precision: bool = True,
     testing: bool = False,
+    *,
+    chol_batch_size: int = 64,
 ) -> MeasOps:
+    """Build UCISD measurements.
+
+    For restricted/unrestricted walkers, ``memory_mode="low"`` batches doubles
+    over ``chol_batch_size`` Cholesky vectors. Generalized walkers retain their
+    existing full-Cholesky kernel.
+    """
     wk = sys.walker_kind.lower()
 
     cfg = UcisdMeasCfg(
         memory_mode=memory_mode,
+        chol_batch_size=chol_batch_size,
         mixed_real_dtype=jnp.float32 if mixed_precision else jnp.float64,
         mixed_complex_dtype=jnp.complex64 if mixed_precision else jnp.complex128,
         mixed_real_dtype_testing=jnp.float64 if testing else jnp.float32,
