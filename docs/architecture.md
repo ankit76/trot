@@ -97,10 +97,23 @@ for Green functions, Green/Cholesky products, HF exchange, the overlap component
 one-body terms, Coulomb dots, scalar reductions, and the final connected-energy
 subtraction. For double-precision inputs these retained operations use
 FP64/complex128; the large T2 products use FP32/complex64 with the matrix-product
-policy. Cholesky vectors are processed individually without converting the
-entire real factor tensor to complex. `mixed_precision=False` preserves the
-original full-precision kernel. This does not change the estimator, trial
-representation, sampling, or precision defaults.
+policy. Both precision paths factor the transition Green function as
+`G = C @ R`, where `R` has shape `(nocc, norb)`, and precompute
+`rot_chol[g] = C.T @ chol[g]` once in the measurement context. Exchange uses
+occupied-space matrices; the other per-Cholesky products have shape
+`(nocc, norb)`. This removes the full orbital-space cubic matrix products from
+the Cholesky loop, as in the Thouless modes implementation. Full-space Green
+and doubles-correction matrices are still formed once per walker, and the
+dense doubles tensor is unchanged. As in dense CISD, the default
+`memory_mode="high"` contracts all Cholesky vectors together, including the
+large T2 applications. `memory_mode="low"` uses groups of `chol_batch_size`
+vectors (default 64) with the same batched contractions. Only the final partial
+group is zero-padded; the entire Hamiltonian is never padded. Real and imaginary
+Green parts are contracted separately with real Cholesky tensors, avoiding a
+full complex Cholesky copy. Both settings work with walker chunking.
+`mixed_precision=False` uses the same half-rotated algebra in input precision.
+The dense kernel retains its existing transpose convention. This does not
+change the estimator, trial representation, sampling, or precision defaults.
 
 A simulation has three stages: **staging**, **job assembly**, and
 **QMC execution**.
