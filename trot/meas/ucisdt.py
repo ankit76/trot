@@ -9,6 +9,7 @@ from jax import lax, tree_util, vmap
 from ..core.ops import MeasOps, k_energy, k_force_bias
 from ..core.system import System
 from ..ham.chol import HamChol
+from .chol_setup import transform_cholesky
 from ..trial.ucisdt import UcisdtTrial, overlap_r, overlap_u
 
 
@@ -1096,24 +1097,18 @@ def build_meas_ctx(
     cb = trial_data.mo_coeff_b
     cbH = trial_data.mo_coeff_b.conj().T
     h1_b = 0.5 * (cbH @ (ham_data.h1 + ham_data.h1.T) @ cb)
-    chol_b = jnp.einsum("pi,gij,jq->gpq", cbH, ham_data.chol, cb)
+    chol_b = transform_cholesky(ham_data.chol, left=cbH, right=cb)
     rot_h1_a = ham_data.h1[:n_oa, :]
     rot_h1_b = ham_data.h1[:n_ob, :]
     rot_chol_a = ham_data.chol[:, :n_oa, :]
     rot_chol_b = chol_b[:, :n_ob, :]
     rot_chol_flat_a = rot_chol_a.reshape(rot_chol_a.shape[0], -1)
     rot_chol_flat_b = rot_chol_b.reshape(rot_chol_b.shape[0], -1)
-    lci1_a = jnp.einsum(
-        "git,pt->gip",
-        ham_data.chol[:, :, n_oa:],
-        trial_data.c1a,
-        optimize="optimal",
+    lci1_a = transform_cholesky(
+        ham_data.chol, right=trial_data.c1a.T, column_slice=(n_oa, ham_data.chol.shape[2])
     )
-    lci1_b = jnp.einsum(
-        "git,pt->gip",
-        chol_b[:, :, n_ob:],
-        trial_data.c1b,
-        optimize="optimal",
+    lci1_b = transform_cholesky(
+        chol_b, right=trial_data.c1b.T, column_slice=(n_ob, chol_b.shape[2])
     )
     return UcisdtMeasCtx(
         h1_b=h1_b,

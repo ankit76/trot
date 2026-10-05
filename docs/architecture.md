@@ -115,6 +115,19 @@ full complex Cholesky copy. Both settings work with walker chunking.
 The dense kernel retains its existing transpose convention. This does not
 change the estimator, trial representation, sampling, or precision defaults.
 
+Unrestricted measurement setup uses a shared 64-vector Cholesky contraction
+helper (`meas/chol_setup.py`). It builds the full beta-basis rotation, singles
+intermediates, and occupied/Thouless half rotations in bounded batches for UHF,
+UCISD, UCISDT, and PT2-UCCSD. Dense, K-mode, and Thouless-mode paths inherit
+this through their shared context builders. This setup policy applies in both
+production memory modes and is independent of the energy batch-size setting.
+The final context arrays retain their existing shapes and precision; no full
+Hamiltonian padding or prefix/tail concatenation is used. Setup compilations
+alone disable GPU autotuning to avoid profiling copies of the full inputs.
+Cholesky model shards are processed locally without gathering the full tensor.
+The full beta-basis Cholesky output is still stored; batching reduces temporary
+workspace, not that persistent storage or production-energy memory.
+
 Dense UCISD and PT2-UCCSD measurements likewise accept
 `memory_mode="low", chol_batch_size=64` for restricted/unrestricted walkers.
 This batches the large doubles contractions in groups of Cholesky vectors,

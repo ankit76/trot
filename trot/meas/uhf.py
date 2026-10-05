@@ -10,6 +10,7 @@ from jax import tree_util
 from ..core.ops import MeasOps, k_energy, k_force_bias, o_density_corr, o_rdm1
 from ..core.system import System
 from ..ham.chol import HamChol
+from .chol_setup import transform_cholesky
 from ..trial.uhf import UhfTrial, overlap_g, overlap_r, overlap_u
 
 
@@ -322,8 +323,8 @@ def build_meas_ctx(ham_data: HamChol, trial_data: UhfTrial) -> UhfMeasCtx:
     cbH = trial_data.mo_coeff_b.conj().T  # (nocc[1], norb)
     rot_h1_a = caH @ ham_data.h1  # (nocc[0], norb)
     rot_h1_b = cbH @ ham_data.h1  # (nocc[1], norb)
-    rot_chol_a = jnp.einsum("pi,gij->gpj", caH, ham_data.chol, optimize="optimal")
-    rot_chol_b = jnp.einsum("pi,gij->gpj", cbH, ham_data.chol, optimize="optimal")
+    rot_chol_a = transform_cholesky(ham_data.chol, left=caH)
+    rot_chol_b = transform_cholesky(ham_data.chol, left=cbH)
     rot_chol_flat_a = rot_chol_a.reshape(rot_chol_a.shape[0], -1)
     rot_chol_flat_b = rot_chol_b.reshape(rot_chol_b.shape[0], -1)
     return UhfMeasCtx(

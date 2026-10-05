@@ -11,6 +11,7 @@ from jax import tree_util
 from ..core.ops import EstimatorOps, MeasOps, k_energy, k_force_bias
 from ..core.system import System
 from ..ham.chol import HamChol
+from .chol_setup import transform_cholesky
 from ..trial.ptuccsd_thouless import (
     PtuccsdThoulessTrial,
     greenp_from_green,
@@ -77,19 +78,9 @@ def build_ptuccsd_thouless_meas_ctx(
     cbh = cb.conj().T
     h1_sym = 0.5 * (ham_data.h1 + ham_data.h1.T.conj())
     h1_b = cbh @ h1_sym @ cb
-    chol_b = jnp.einsum("pi,gij,jq->gpq", cbh, ham_data.chol, cb, optimize="optimal")
-    rot_chol_a = jnp.einsum(
-        "pi,gpq->giq",
-        trial_data.mo_t_a.conj(),
-        ham_data.chol,
-        optimize="optimal",
-    )
-    rot_chol_b = jnp.einsum(
-        "pi,gpq->giq",
-        trial_data.mo_t_b.conj(),
-        chol_b,
-        optimize="optimal",
-    )
+    chol_b = transform_cholesky(ham_data.chol, left=cbh, right=cb)
+    rot_chol_a = transform_cholesky(ham_data.chol, left=trial_data.mo_t_a.conj().T)
+    rot_chol_b = transform_cholesky(chol_b, left=trial_data.mo_t_b.conj().T)
     return PtuccsdThoulessMeasCtx(
         h1_b=h1_b,
         chol_b=chol_b,
