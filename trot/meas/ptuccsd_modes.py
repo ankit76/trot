@@ -2022,6 +2022,71 @@ def _energy_components_uw_rh(
     )
 
 
+
+def initial_components_ptuccsd_mode_rw_rh(
+    walker: jax.Array,
+    ham_data: HamChol,
+    meas_ctx: PtuccsdModeMeasCtx,
+    trial_data: PtuccsdThoulessModeTrial,
+) -> jax.Array:
+    """Exact block-zero components with bounded, vectorized Cholesky batches.
+
+    The initial walker does not use production pair sampling. Sum all residual
+    terms in groups of cfg.chol_batch_size (64 by default), retaining only two
+    scalars between groups, rather than materializing full-Cholesky products.
+    """
+    noa, nob = trial_data.nocc
+    common = _ptuccsd_mode_energy_common_uw_rh(
+        (walker[:, :noa], walker[:, :nob]), ham_data, meas_ctx, trial_data
+    )
+    # Vectorize each group even if production selected the scalar low-memory
+    # path; initialization has only one representative walker.
+    batch_ctx = replace(meas_ctx, base=replace(
+        meas_ctx.base, cfg=replace(meas_ctx.cfg, memory_mode="high")
+    ))
+
+    def local_sum(common, chol_a, rot_a, chol_b, rot_b, trial):
+        tensors = (chol_a, rot_a, chol_b, rot_b)
+        batch_size = meas_ctx.cfg.chol_batch_size
+        nchol = chol_a.shape[0]
+
+        def terms(tensors):
+            values = _ptuccsd_mode_chol_terms(common, *tensors, batch_ctx, trial)
+            return jnp.sum(values, axis=0, dtype=jnp.complex128)
+
+        total = jnp.zeros((2,), dtype=jnp.complex128)
+        if meas_ctx.cfg.chol_mesh is not None:
+            total = lax.pcast(total, ("model",), to="varying")
+        nfull, remainder = divmod(nchol, batch_size)
+
+        def accumulate(index, total):
+            batches = tuple(lax.dynamic_slice_in_dim(
+                tensor, index * batch_size, batch_size, axis=0
+            ) for tensor in tensors)
+            return total + terms(batches)
+
+        if nfull:
+            total = lax.fori_loop(0, nfull, accumulate, total)
+        if remainder:
+            total = total + terms(tuple(t[nfull * batch_size:] for t in tensors))
+        if meas_ctx.cfg.chol_mesh is not None:
+            total = lax.psum(total, "model")
+        return total
+
+    args = (common, ham_data.chol, meas_ctx.rot_chol_a,
+            meas_ctx.chol_b, meas_ctx.rot_chol_b, trial_data)
+    if meas_ctx.cfg.chol_mesh is not None:
+        chol_sum = jax.shard_map(
+            local_sum, mesh=meas_ctx.cfg.chol_mesh,
+            in_specs=(P(), P("model"), P("model"), P("model"), P("model"), P()),
+            out_specs=P(),
+        )(*args)
+    else:
+        chol_sum = local_sum(*args)
+    return jnp.stack((common.theta, common.electronic_0_base + chol_sum[0],
+                      common.h_t_base + chol_sum[1]))
+
+
 def components_ptuccsd_mode_uw_rh(
     walker: tuple[jax.Array, jax.Array],
     ham_data: HamChol,
@@ -2204,6 +2269,7 @@ def make_ptuccsd_mode_estimator_ops(
     return EstimatorOps(
         reference_overlap=reference_overlap_r,
         components=components_ptuccsd_mode_rw_rh,
+        initial_components=initial_components_ptuccsd_mode_rw_rh,
         combine_energy=combine_first_order_energy,
         component_names=("theta", "electronic_0", "h_t"),
         build_estimator_ctx=lambda ham_data, trial_data: build_ptuccsd_mode_meas_ctx(

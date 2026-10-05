@@ -346,11 +346,14 @@ def _initial_projected_estimator(
     """
 
     walker_0 = wk.take_walkers(state.walkers, jnp.asarray([0]))
-    components_0 = wk.vmap_chunked(
-        estimator_ops.components,
-        n_chunks=1,
-        in_axes=(0, None, None, None),
-    )(walker_0, ham_data, estimator_ctx, estimator_data)[0]
+    initial_components = estimator_ops.initial_components or estimator_ops.components
+    # Match propagation initialization: compile the one-time calculation as a
+    # whole and avoid autotuner copies of large Hamiltonian/trial operands.
+    evaluate = jax.jit(
+        wk.vmap_chunked(initial_components, n_chunks=1, in_axes=(0, None, None, None)),
+        compiler_options={"xla_gpu_autotune_level": 0},
+    )
+    components_0 = evaluate(walker_0, ham_data, estimator_ctx, estimator_data)[0]
     energy_0 = estimator_ops.combine_energy(ham_data.h0, components_0)
 
     reference_overlap_0 = wk.vmap_chunked(

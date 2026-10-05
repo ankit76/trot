@@ -369,6 +369,9 @@ class EstimatorOps:
     # The ordinary two-argument builder remains available for standalone use.
     build_estimator_ctx_from_guide: Callable[[ham_data, trial_data, trial_data, Any], Any] | None = None
 
+    # Optional deterministic, bounded-workspace kernel for block-zero reporting.
+    initial_components: MeasKernel | None = None
+
     def __post_init__(self) -> None:
         if not self.component_names:
             raise ValueError("EstimatorOps.component_names must be nonempty.")

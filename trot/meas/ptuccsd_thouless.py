@@ -11,9 +11,10 @@ from jax.sharding import Mesh
 
 from ..core.ops import EstimatorOps, MeasOps, k_energy, k_force_bias
 from ..core.system import System
+from ..trial.doubles_contract import apply_doubles
 from ..ham.chol import HamChol
 from .chol_setup import shared_beta_cholesky, transform_cholesky
-from .chol_contract import contract_cholesky
+from .chol_contract import contract_cholesky, contract_half_rotated
 from ..sharding import cholesky_model_mesh
 from ..trial.ptuccsd_thouless import (
     PtuccsdThoulessTrial,
@@ -460,29 +461,30 @@ def _energy_components_uw_rh(
     e1_0 = jnp.einsum("ij,ij->", h1_a, green_a, optimize="optimal")
     e1_0 += jnp.einsum("ij,ij->", h1_b, green_b, optimize="optimal")
 
-    t2g_a = 0.25 * jnp.einsum(
-        "ptqu,pt->qu",
-        t2aa.astype(cfg.mixed_real_dtype),
+    t2g_a = 0.25 * apply_doubles(
+        t2aa,
         green_occ_a.astype(cfg.mixed_complex_dtype),
-        optimize="optimal",
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
-    t2g_b = 0.25 * jnp.einsum(
-        "ptqu,pt->qu",
-        t2bb.astype(cfg.mixed_real_dtype),
+    t2g_b = 0.25 * apply_doubles(
+        t2bb,
         green_occ_b.astype(cfg.mixed_complex_dtype),
-        optimize="optimal",
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
-    t2g_ab_a = jnp.einsum(
-        "ptqu,qu->pt",
-        t2ab.astype(cfg.mixed_real_dtype),
+    t2g_ab_a = apply_doubles(
+        t2ab,
         green_occ_b.astype(cfg.mixed_complex_dtype),
-        optimize="optimal",
+        transpose=True,
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
-    t2g_ab_b = jnp.einsum(
-        "ptqu,pt->qu",
-        t2ab.astype(cfg.mixed_real_dtype),
+    t2g_ab_b = apply_doubles(
+        t2ab,
         green_occ_a.astype(cfg.mixed_complex_dtype),
-        optimize="optimal",
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
     theta2a = jnp.einsum("qu,qu->", t2g_a, green_occ_a, optimize="optimal")
     theta2b = jnp.einsum("qu,qu->", t2g_b, green_occ_b, optimize="optimal")
@@ -501,15 +503,11 @@ def _energy_components_uw_rh(
     e1_2 -= jnp.einsum("ij,ij->", h1_a, combo_a, optimize="optimal")
     e1_2 -= jnp.einsum("ij,ij->", h1_b, combo_b, optimize="optimal")
 
-    lg_a = jnp.einsum("giq,iq->g", rot_chol_a, half_green_a, optimize="optimal")
-    lg_b = jnp.einsum("giq,iq->g", rot_chol_b, half_green_b, optimize="optimal")
+    lg_a = contract_half_rotated(rot_chol_a, half_green_a)
+    lg_b = contract_half_rotated(rot_chol_b, half_green_b)
     lg = lg_a + lg_b
-    lg1_a = jnp.einsum(
-        "gip,jp->gij", rot_chol_a, half_green_a, optimize="optimal"
-    )
-    lg1_b = jnp.einsum(
-        "gip,jp->gij", rot_chol_b, half_green_b, optimize="optimal"
-    )
+    lg1_a = contract_half_rotated(rot_chol_a, half_green_a, exchange=True)
+    lg1_b = contract_half_rotated(rot_chol_b, half_green_b, exchange=True)
     e2_0 = 0.5 * (lg @ lg)
     e2_0 -= 0.5 * (
         jnp.sum(lg1_a * jnp.swapaxes(lg1_a, -1, -2))
@@ -569,27 +567,24 @@ def _energy_components_uw_rh(
         glgp_b = jnp.einsum(
             "gpi,it->gpt", gl_occ_b, greenp_b_mixed, optimize="optimal"
         ).astype(cfg.mixed_complex_dtype_testing)
-        l2t2_a = 0.5 * jnp.einsum(
-            "gpt,gqu,ptqu->g",
+        l2t2_a = 0.5 * jnp.sum(apply_doubles(
+            t2aa,
             glgp_a,
+            dtype=cfg.mixed_real_dtype_testing,
+            low_memory=cfg.memory_mode == "low",
+        ) * glgp_a, axis=(-2, -1))
+        l2t2_b = 0.5 * jnp.sum(apply_doubles(
+            t2bb,
+            glgp_b,
+            dtype=cfg.mixed_real_dtype_testing,
+            low_memory=cfg.memory_mode == "low",
+        ) * glgp_b, axis=(-2, -1))
+        l2t2_ab = jnp.sum(apply_doubles(
+            t2ab,
             glgp_a,
-            t2aa.astype(cfg.mixed_real_dtype_testing),
-            optimize="optimal",
-        )
-        l2t2_b = 0.5 * jnp.einsum(
-            "gpt,gqu,ptqu->g",
-            glgp_b,
-            glgp_b,
-            t2bb.astype(cfg.mixed_real_dtype_testing),
-            optimize="optimal",
-        )
-        l2t2_ab = jnp.einsum(
-            "gpt,gqu,ptqu->g",
-            glgp_a,
-            glgp_b,
-            t2ab.astype(cfg.mixed_real_dtype_testing),
-            optimize="optimal",
-        )
+            dtype=cfg.mixed_real_dtype_testing,
+            low_memory=cfg.memory_mode == "low",
+        ) * glgp_b, axis=(-2, -1))
         e2_2_3 = jnp.sum(l2t2_a + l2t2_b + l2t2_ab)
         return e2_2_2_2, e2_2_3
 

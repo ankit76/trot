@@ -10,9 +10,10 @@ from jax.sharding import Mesh
 
 from ..core.ops import MeasOps, k_energy, k_force_bias
 from ..core.system import System
+from ..trial.doubles_contract import apply_doubles
 from ..ham.chol import HamChol
 from .chol_setup import transform_cholesky
-from .chol_contract import contract_cholesky
+from .chol_contract import contract_cholesky, contract_half_rotated
 from ..sharding import cholesky_model_mesh
 from ..trial.ucisd import UcisdTrial, overlap_g, overlap_r, overlap_u
 
@@ -188,8 +189,8 @@ def force_bias_kernel_uw_rh(
     chol_b = meas_ctx.chol_b
     rot_chol_a = meas_ctx.rot_chol_a
     rot_chol_b = meas_ctx.rot_chol_b
-    lg_a = jnp.einsum("gpj,pj->g", rot_chol_a, green_a, optimize="optimal")
-    lg_b = jnp.einsum("gpj,pj->g", rot_chol_b, green_b, optimize="optimal")
+    lg_a = contract_half_rotated(rot_chol_a, green_a)
+    lg_b = contract_half_rotated(rot_chol_b, green_b)
     lg = lg_a + lg_b
 
     # ref
@@ -210,25 +211,30 @@ def force_bias_kernel_uw_rh(
     fb_1 = fb_1_1 + fb_1_2
 
     # double excitations
-    ci2g_a = jnp.einsum(
-        "ptqu,pt->qu",
-        c2aa.astype(cfg.mixed_real_dtype),
+    ci2g_a = apply_doubles(
+        c2aa,
         green_occ_a.astype(cfg.mixed_complex_dtype),
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
-    ci2g_b = jnp.einsum(
-        "ptqu,pt->qu",
-        c2bb.astype(cfg.mixed_real_dtype),
+    ci2g_b = apply_doubles(
+        c2bb,
         green_occ_b.astype(cfg.mixed_complex_dtype),
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
-    ci2g_ab_a = jnp.einsum(
-        "ptqu,qu->pt",
-        c2ab.astype(cfg.mixed_real_dtype),
+    ci2g_ab_a = apply_doubles(
+        c2ab,
         green_occ_b.astype(cfg.mixed_complex_dtype),
+        transpose=True,
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
-    ci2g_ab_b = jnp.einsum(
-        "ptqu,pt->qu",
-        c2ab.astype(cfg.mixed_real_dtype),
+    ci2g_ab_b = apply_doubles(
+        c2ab,
         green_occ_a.astype(cfg.mixed_complex_dtype),
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
     gci2g_a = 0.5 * jnp.einsum("qu,qu->", ci2g_a, green_occ_a, optimize="optimal")
     gci2g_b = 0.5 * jnp.einsum("qu,qu->", ci2g_b, green_occ_b, optimize="optimal")
@@ -527,30 +533,35 @@ def energy_kernel_uw_rh(
 
     # double excitations
     ci2g_a = (
-        jnp.einsum(
-            "ptqu,pt->qu",
-            c2aa.astype(cfg.mixed_real_dtype),
+        apply_doubles(
+            c2aa,
             green_occ_a.astype(cfg.mixed_complex_dtype),
+            dtype=cfg.mixed_real_dtype,
+            low_memory=cfg.memory_mode == "low",
         )
         / 4
     )
     ci2g_b = (
-        jnp.einsum(
-            "ptqu,pt->qu",
-            c2bb.astype(cfg.mixed_real_dtype),
+        apply_doubles(
+            c2bb,
             green_occ_b.astype(cfg.mixed_complex_dtype),
+            dtype=cfg.mixed_real_dtype,
+            low_memory=cfg.memory_mode == "low",
         )
         / 4
     )
-    ci2g_ab_a = jnp.einsum(
-        "ptqu,qu->pt",
-        c2ab.astype(cfg.mixed_real_dtype),
+    ci2g_ab_a = apply_doubles(
+        c2ab,
         green_occ_b.astype(cfg.mixed_complex_dtype),
+        transpose=True,
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
-    ci2g_ab_b = jnp.einsum(
-        "ptqu,pt->qu",
-        c2ab.astype(cfg.mixed_real_dtype),
+    ci2g_ab_b = apply_doubles(
+        c2ab,
         green_occ_a.astype(cfg.mixed_complex_dtype),
+        dtype=cfg.mixed_real_dtype,
+        low_memory=cfg.memory_mode == "low",
     )
     gci2g_a = jnp.einsum("qu,qu->", ci2g_a, green_occ_a, optimize="optimal")
     gci2g_b = jnp.einsum("qu,qu->", ci2g_b, green_occ_b, optimize="optimal")
@@ -570,8 +581,8 @@ def energy_kernel_uw_rh(
 
     # two body energy
     # ref
-    lg_a = jnp.einsum("gpj,pj->g", rot_chol_a, green_a, optimize="optimal")
-    lg_b = jnp.einsum("gpj,pj->g", rot_chol_b, green_b, optimize="optimal")
+    lg_a = contract_half_rotated(rot_chol_a, green_a)
+    lg_b = contract_half_rotated(rot_chol_b, green_b)
     e2_0_1 = ((lg_a + lg_b) @ (lg_a + lg_b)) / 2.0
     lg1_a = jnp.einsum("gpj,qj->gpq", rot_chol_a, green_a, optimize="optimal")
     lg1_b = jnp.einsum("gpj,qj->gpq", rot_chol_b, green_b, optimize="optimal")
@@ -662,27 +673,24 @@ def energy_kernel_uw_rh(
         glgp_b = jnp.einsum("gpi,it->gpt", gl_b, greenp_b, optimize="optimal").astype(
             cfg.mixed_complex_dtype_testing
         )
-        l2ci2_a = 0.5 * jnp.einsum(
-            "gpt,gqu,ptqu->g",
+        l2ci2_a = 0.5 * jnp.sum(apply_doubles(
+            c2aa,
             glgp_a,
+            dtype=cfg.mixed_real_dtype_testing,
+            low_memory=cfg.memory_mode == "low",
+        ) * glgp_a, axis=(-2, -1))
+        l2ci2_b = 0.5 * jnp.sum(apply_doubles(
+            c2bb,
+            glgp_b,
+            dtype=cfg.mixed_real_dtype_testing,
+            low_memory=cfg.memory_mode == "low",
+        ) * glgp_b, axis=(-2, -1))
+        l2c2ab = jnp.sum(apply_doubles(
+            c2ab,
             glgp_a,
-            c2aa.astype(cfg.mixed_real_dtype_testing),
-            optimize="optimal",
-        )
-        l2ci2_b = 0.5 * jnp.einsum(
-            "gpt,gqu,ptqu->g",
-            glgp_b,
-            glgp_b,
-            c2bb.astype(cfg.mixed_real_dtype_testing),
-            optimize="optimal",
-        )
-        l2c2ab = jnp.einsum(
-            "gpt,gqu,ptqu->g",
-            glgp_a,
-            glgp_b,
-            c2ab.astype(cfg.mixed_real_dtype_testing),
-            optimize="optimal",
-        )
+            dtype=cfg.mixed_real_dtype_testing,
+            low_memory=cfg.memory_mode == "low",
+        ) * glgp_b, axis=(-2, -1))
         e2_2_3 = l2ci2_a.sum() + l2ci2_b.sum() + l2c2ab.sum()
         return e2_2_2_2, e2_2_3
 

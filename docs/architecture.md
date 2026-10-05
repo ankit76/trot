@@ -147,6 +147,25 @@ energy contraction helper, independently of the doubles-energy memory mode.
 Model-sharded inputs use local Cholesky batches. Production autotuning and
 matrix-product precision settings are unchanged.
 
+Projected-estimator block-zero reporting has an optional
+`EstimatorOps.initial_components` kernel. PT2-UCCSD modes use it to sum all
+Cholesky contributions deterministically in vectorized groups of 64, including
+local model shards. It does not invoke the production pair sampler. The driver
+compiles this one-time calculation together with setup-only GPU autotuning
+disabled, as for propagation initialization.
+
+Real UCISD doubles are applied to real and imaginary Green-function parts
+separately in the full-precision overlap and dense measurements, avoiding a
+full complex doubles copy. Dense PT2-UCCSD energy uses the same helper. In
+`memory_mode="low"`, measurement dtype conversions are performed inside
+1024-pair slices of the summed occupied-virtual dimension; the configured
+64-vector Cholesky batches remain unchanged. This also avoids keeping full
+FP32 doubles copies live across the Cholesky loop. Half-rotated traces and
+PT2 exchange likewise split real/imaginary products in full precision, avoiding
+complex copies of those Cholesky factors. Stored amplitudes and
+arithmetic dtypes are unchanged; the sliced sums can differ by floating-point
+reduction order. High-memory measurements keep unsliced tensor applications.
+
 Dense UCISD and PT2-UCCSD measurements likewise accept
 `memory_mode="low", chol_batch_size=64` for restricted/unrestricted walkers.
 This batches the large doubles contractions in groups of Cholesky vectors,

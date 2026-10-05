@@ -213,3 +213,121 @@ def test_shared_context_is_one_compiled_argument():
     separate_bytes, expected = compile_case(jnp.array(np.asarray(shared)))
     assert separate_bytes - shared_bytes == shared.nbytes
     np.testing.assert_allclose(result['value'], expected['value'])
+
+
+@pytest.mark.parametrize('transpose', [False, True])
+@pytest.mark.parametrize('batch', [(), (3,)])
+@pytest.mark.parametrize('dtype', [jnp.float32, jnp.float64, jnp.complex128])
+@pytest.mark.parametrize('empty', [False, True])
+def test_doubles_application_matches_direct_einsum(transpose, batch, dtype, empty):
+    from trot.trial.doubles_contract import apply_doubles
+    rng = np.random.default_rng(20713)
+    shape = (2, 0 if empty else 4, 3, 5)
+    tensor = rng.normal(size=shape)
+    if jnp.issubdtype(dtype, jnp.complexfloating):
+        tensor = tensor + 1j*rng.normal(size=shape)
+    tensor = jnp.asarray(tensor, dtype=dtype)
+    pair = shape[2:] if transpose else shape[:2]
+    vector_dtype = jnp.complex64 if dtype == jnp.float32 else jnp.complex128
+    vector = jnp.asarray(rng.normal(size=batch+pair) + 1j*rng.normal(size=batch+pair), dtype=vector_dtype)
+    actual = jax.jit(partial(apply_doubles, transpose=transpose))(tensor, vector)
+    spec = 'ptqu,...qu->...pt' if transpose else 'ptqu,...pt->...qu'
+    expected = jnp.einsum(spec, tensor, vector)
+    np.testing.assert_allclose(actual, expected, atol=3e-6 if dtype == jnp.float32 else 1e-12,
+                               rtol=2e-6 if dtype == jnp.float32 else 1e-12)
+    assert actual.dtype == expected.dtype
+
+
+@pytest.mark.parametrize('nchol', [0, 1, 67])
+@pytest.mark.parametrize('batch_size', [4, 64])
+def test_initial_mode_components_match_all_choleskies(nchol, batch_size):
+    _, ham, _, trial, walkers, _, ops = _trial_pair(True)
+    ham = replace(ham, chol=ham.chol[:nchol], nchol=nchol)
+    cfg = ptuccsd_modes.PtuccsdModeMeasCfg(
+        mixed_real_dtype=jnp.float32, mixed_complex_dtype=jnp.complex64,
+        chol_batch_size=batch_size)
+    ctx = ptuccsd_modes.build_ptuccsd_mode_meas_ctx(ham, trial, cfg)
+    initial = jax.jit(ops.initial_components)
+    expected = jax.jit(ops.components)(walkers[0], ham, ctx, trial)
+    actual = initial(walkers[0], ham, ctx, trial)
+    np.testing.assert_allclose(actual, expected, atol=3e-7, rtol=2e-6)
+
+
+def test_initial_mode_components_keep_model_shards_local():
+    if jax.local_device_count() < 2:
+        pytest.skip('Requires two logical CPU devices or GPUs.')
+    _, ham, _, trial, walkers, _, ops = _trial_pair(True)
+    ham = replace(ham, chol=jnp.concatenate((ham.chol, ham.chol)), nchol=134)
+    cfg = ptuccsd_modes.PtuccsdModeMeasCfg(
+        mixed_real_dtype=jnp.float32, mixed_complex_dtype=jnp.complex64)
+    ctx = ptuccsd_modes.build_ptuccsd_mode_meas_ctx(ham, trial, cfg)
+    expected = jax.jit(ops.components)(walkers[0], ham, ctx, trial)
+    mesh = Mesh(np.asarray(jax.local_devices()[:2]), ('model',))
+    ham = replace(ham, h0=replicate(ham.h0, mesh), h1=replicate(ham.h1, mesh),
+                  chol=shard_model_axis(ham.chol, mesh))
+    ctx = replace(ctx, base=replace(ctx.base,
+        h1_b=replicate(ctx.h1_b, mesh), chol_b=shard_model_axis(ctx.chol_b, mesh),
+        rot_chol_a=shard_model_axis(ctx.rot_chol_a, mesh),
+        rot_chol_b=shard_model_axis(ctx.rot_chol_b, mesh), cfg=replace(cfg, chol_mesh=mesh)))
+    trial = jax.tree.map(lambda a: replicate(a, mesh), trial)
+    walker = replicate(walkers[0], mesh)
+    executable = jax.jit(ops.initial_components).lower(walker, ham, ctx, trial).compile()
+    assert ' all-gather(' not in executable.as_text()
+    actual = executable(walker, ham, ctx, trial)
+    np.testing.assert_allclose(actual, expected, atol=3e-7, rtol=2e-6)
+
+
+def test_projected_initialization_uses_initial_components_hook():
+    from tests.test_mixed_estimator import _make_case
+    from trot.driver import _initial_projected_estimator
+    _, _, ham, state, _, _, _, ops = _make_case()
+    def fail(*args):
+        raise AssertionError('Production components must not be used for initialization')
+    def initial(walker, ham, ctx, trial):
+        return jnp.asarray([0., 7., 0.])
+    ops = replace(ops, components=fail, initial_components=initial,
+                  combine_energy=lambda h0, components: h0 + components[1])
+    value, _ = _initial_projected_estimator(state, ham_data=ham, estimator_data=jnp.array(1.),
+                                           estimator_ctx=jnp.array(0.), estimator_ops=ops)
+    np.testing.assert_allclose(value, float(ham.h0)+7.)
+
+
+@pytest.mark.parametrize('transpose', [False, True])
+@pytest.mark.parametrize('batch', [(), (3,)])
+def test_low_memory_doubles_casts_match_full_cast(monkeypatch, transpose, batch):
+    from trot.trial import doubles_contract
+    monkeypatch.setattr(doubles_contract, '_DOUBLES_PAIR_BATCH_SIZE', 3)
+    rng = np.random.default_rng(20714)
+    tensor = jnp.asarray(rng.normal(size=(2, 4, 3, 5)))
+    pair = tensor.shape[2:] if transpose else tensor.shape[:2]
+    vectors = jnp.asarray(rng.normal(size=batch+pair) + 1j*rng.normal(size=batch+pair), dtype=jnp.complex64)
+    fn = partial(doubles_contract.apply_doubles, transpose=transpose, dtype=jnp.float32)
+    actual = jax.jit(partial(fn, low_memory=True))(tensor, vectors)
+    expected = jax.jit(fn)(tensor, vectors)
+    np.testing.assert_allclose(actual, expected, atol=3e-6, rtol=2e-6)
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_low_memory_doubles_cast_workspace_is_bounded(transpose):
+    from trot.trial.doubles_contract import apply_doubles
+    tensor = jax.ShapeDtypeStruct((16, 128, 16, 128), jnp.float64)
+    vectors = jax.ShapeDtypeStruct((3, 16, 128), jnp.complex64)
+    fn = jax.jit(partial(apply_doubles, dtype=jnp.float32, low_memory=True, transpose=transpose))
+    executable = fn.lower(tensor, vectors).compile()
+    # A full complex64 copy would be 32 MiB. Allow a real cast of a pair batch
+    # and the small accumulator, rather than a tensor-sized complex temporary.
+    assert executable.memory_analysis().temp_size_in_bytes < 16 * 2**20
+
+
+@pytest.mark.parametrize('exchange', [False, True])
+@pytest.mark.parametrize('complex_chol', [False, True])
+def test_half_rotated_contractions_match_complex_reference(exchange, complex_chol):
+    from trot.meas.chol_contract import contract_half_rotated
+    rng = np.random.default_rng(20715)
+    chol = rng.normal(size=(7, 3, 9))
+    if complex_chol:
+        chol = chol + 1j*rng.normal(size=chol.shape)
+    green = rng.normal(size=(3, 9)) + 1j*rng.normal(size=(3, 9))
+    actual = jax.jit(partial(contract_half_rotated, exchange=exchange))(chol, green)
+    expected = np.einsum('gip,jp->gij' if exchange else 'gip,ip->g', chol, green)
+    np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)

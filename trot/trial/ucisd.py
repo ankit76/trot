@@ -8,6 +8,7 @@ from jax import tree_util
 
 from ..core.ops import TrialOps
 from ..core.system import System
+from .doubles_contract import apply_doubles
 
 
 @tree_util.register_pytree_node_class
@@ -124,9 +125,9 @@ def overlap_u(walker: tuple[jax.Array, jax.Array], trial_data: UcisdTrial) -> ja
     o0 = jnp.linalg.det(woa) * jnp.linalg.det(wob)
     o1 = jnp.einsum("ia,ia", c1a, g_a) + jnp.einsum("ia,ia", c1b, g_b)
     o2 = (
-        0.5 * jnp.einsum("iajb, ia, jb", c2aa, g_a, g_a)
-        + 0.5 * jnp.einsum("iajb, ia, jb", c2bb, g_b, g_b)
-        + jnp.einsum("iajb, ia, jb", c2ab, g_a, g_b)
+        0.5 * jnp.sum(apply_doubles(c2aa, g_a) * g_a)
+        + 0.5 * jnp.sum(apply_doubles(c2bb, g_b) * g_b)
+        + jnp.sum(apply_doubles(c2ab, g_a) * g_b)
     )
     return (1.0 + o1 + o2) * o0
 

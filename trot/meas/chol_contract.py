@@ -52,3 +52,14 @@ def _contract_local(chol, matrix, *, cfg, model_sharded=False):
         start = nfull * batch_size
         output = lax.dynamic_update_slice_in_dim(output, contract(chol[start:]), start, axis=0)
     return output
+
+
+def contract_half_rotated(chol, half_green, *, exchange=False):
+    """Full-precision half-rotated traces/exchange without a complex L copy."""
+    spec = "gip,jp->gij" if exchange else "gip,ip->g"
+    if jnp.issubdtype(chol.dtype, jnp.floating) and jnp.iscomplexobj(half_green):
+        real = jnp.einsum(spec, chol, half_green.real, optimize="optimal")
+        imag = jnp.einsum(spec, chol, half_green.imag, optimize="optimal")
+        dtype = jnp.result_type(chol, half_green)
+        return real.astype(dtype) + jnp.asarray(1j, dtype=dtype) * imag
+    return jnp.einsum(spec, chol, half_green, optimize="optimal")
