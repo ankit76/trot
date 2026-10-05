@@ -376,3 +376,53 @@ def slice_walkers(walkers: Any, walker_kind: str, norb_keep: int | None) -> Any:
 
 def take_walkers(walkers: Any, idx: jnp.ndarray) -> Any:
     return jax.tree_util.tree_map(lambda x: x[idx, ...], walkers)
+
+
+# ======================================================================================
+# unrestricted (uchol) hamiltonian: the two spins may live in different orbital spaces
+# ======================================================================================
+
+
+def split_rdm1_u(rdm1: Any) -> tuple[jax.Array, jax.Array]:
+    """
+    Spin blocks of a trial rdm1 for the unrestricted hamiltonian.
+
+    Accepts a pair (dm_a, dm_b) with independent shapes, or a stacked (2, norb, norb)
+    array when the two spin spaces happen to have equal size.
+    """
+    dm_a, dm_b = rdm1[0], rdm1[1]
+    if jnp.ndim(dm_a) != 2 or jnp.ndim(dm_b) != 2:
+        raise ValueError(
+            "rdm1 must hold two (norb_sigma, norb_sigma) spin blocks, got shapes "
+            f"{jnp.shape(dm_a)} and {jnp.shape(dm_b)}"
+        )
+    return dm_a, dm_b
+
+
+def init_walkers_uh(sys: Any, rdm1: Any, n_walkers: int) -> walkers:
+    """
+    Initialize unrestricted walkers from per spin natural orbitals, allowing the alpha
+    and beta orbital spaces to differ in size.
+
+    rdm1 must hold two spin blocks (dm_a, dm_b) of shape (norb_a, norb_a) and
+    (norb_b, norb_b). A stacked (2, norb, norb) array cannot represent norb_a != norb_b,
+    which is why init_walkers cannot be reused here. sys.norb is not consulted: the two
+    orbital dimensions are taken from rdm1.
+    """
+    wk = (sys.walker_kind).lower()
+    if wk != "unrestricted":
+        raise ValueError(f"init_walkers_uh requires walker_kind='unrestricted', got {wk}")
+
+    dm_a, dm_b = split_rdm1_u(rdm1)
+    nup, ndn = sys.nup, sys.ndn
+
+    for name, dm, nocc in (("a", dm_a, nup), ("b", dm_b, ndn)):
+        norb_s = int(jnp.shape(dm)[0])
+        if nocc > norb_s:
+            raise ValueError(f"spin {name} has {nocc} electrons but only {norb_s} orbitals in rdm1")
+
+    natorbs_up = _natorbs(dm_a, nup) + 0.0j  # (norb_a, nup)
+    natorbs_dn = _natorbs(dm_b, ndn) + 0.0j  # (norb_b, ndn)
+    wu = jnp.broadcast_to(natorbs_up, (n_walkers, *natorbs_up.shape))
+    wd = jnp.broadcast_to(natorbs_dn, (n_walkers, *natorbs_dn.shape))
+    return (wu, wd)
