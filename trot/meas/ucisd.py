@@ -1,16 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral
 
 import jax
 import jax.numpy as jnp
 from jax import lax, tree_util, vmap
+from jax.sharding import Mesh
 
 from ..core.ops import MeasOps, k_energy, k_force_bias
 from ..core.system import System
 from ..ham.chol import HamChol
 from .chol_setup import transform_cholesky
+from .chol_contract import contract_cholesky
+from ..sharding import cholesky_model_mesh
 from ..trial.ucisd import UcisdTrial, overlap_g, overlap_r, overlap_u
 
 
@@ -62,7 +65,8 @@ class UcisdMeasCfg:
     mixed_complex_dtype: jnp.dtype = jnp.complex128
     mixed_real_dtype_testing: jnp.dtype = jnp.float32
     mixed_complex_dtype_testing: jnp.dtype = jnp.complex64
-    chol_batch_size: int = 64  # vectors per doubles contraction in low-memory mode
+    chol_batch_size: int = 64  # force bias; also doubles in low-memory mode
+    chol_mesh: Mesh | None = None
 
     def __post_init__(self) -> None:
         if self.memory_mode not in {"low", "high"}:
@@ -200,16 +204,8 @@ def force_bias_kernel_uw_rh(
     ci1gp_b = jnp.einsum("pt,it->pi", c1b, greenp_b, optimize="optimal")
     gci1gp_a = jnp.einsum("pj,pi->ij", green_a, ci1gp_a, optimize="optimal")
     gci1gp_b = jnp.einsum("pj,pi->ij", green_b, ci1gp_b, optimize="optimal")
-    fb_1_2 = -jnp.einsum(
-        "gij,ij->g",
-        chol_a.astype(cfg.mixed_real_dtype),
-        gci1gp_a.astype(cfg.mixed_complex_dtype),
-        optimize="optimal",
-    ) - jnp.einsum(
-        "gij,ij->g",
-        chol_b.astype(cfg.mixed_real_dtype),
-        gci1gp_b.astype(cfg.mixed_complex_dtype),
-        optimize="optimal",
+    fb_1_2 = -contract_cholesky(chol_a, gci1gp_a, cfg) - contract_cholesky(
+        chol_b, gci1gp_b, cfg
     )
     fb_1 = fb_1_1 + fb_1_2
 
@@ -241,18 +237,8 @@ def force_bias_kernel_uw_rh(
     fb_2_1 = lg * gci2g
     ci2_green_a = (greenp_a @ (ci2g_a + ci2g_ab_a).T) @ green_a
     ci2_green_b = (greenp_b @ (ci2g_b + ci2g_ab_b).T) @ green_b
-    fb_2_2_a = -jnp.einsum(
-        "gij,ij->g",
-        chol_a.astype(cfg.mixed_real_dtype),
-        ci2_green_a.astype(cfg.mixed_complex_dtype),
-        optimize="optimal",
-    )
-    fb_2_2_b = -jnp.einsum(
-        "gij,ij->g",
-        chol_b.astype(cfg.mixed_real_dtype),
-        ci2_green_b.astype(cfg.mixed_complex_dtype),
-        optimize="optimal",
-    )
+    fb_2_2_a = -contract_cholesky(chol_a, ci2_green_a, cfg)
+    fb_2_2_b = -contract_cholesky(chol_b, ci2_green_b, cfg)
     fb_2_2 = fb_2_2_a + fb_2_2_b
     fb_2 = fb_2_1 + fb_2_2
 
@@ -1248,6 +1234,7 @@ def build_meas_ctx(
 ) -> UcisdMeasCtx:
     if ham_data.basis != "restricted":
         raise ValueError("UCISD MeasOps currently assumes HamChol.basis == 'restricted'.")
+    cfg = replace(cfg, chol_mesh=cholesky_model_mesh(ham_data.chol))
     n_oa, n_ob = trial_data.nocc
     cb = trial_data.mo_coeff_b  # (norb, nocc[1])
     cbH = trial_data.mo_coeff_b.conj().T  # (nocc[1], norb)

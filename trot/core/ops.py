@@ -365,6 +365,10 @@ class EstimatorOps:
     # would duplicate (or dominate) the cost of a sampled block estimator.
     use_for_population_control: bool = False
 
+    # Optional host-side builder that can reuse compatible guide intermediates.
+    # The ordinary two-argument builder remains available for standalone use.
+    build_estimator_ctx_from_guide: Callable[[ham_data, trial_data, trial_data, Any], Any] | None = None
+
     def __post_init__(self) -> None:
         if not self.component_names:
             raise ValueError("EstimatorOps.component_names must be nonempty.")

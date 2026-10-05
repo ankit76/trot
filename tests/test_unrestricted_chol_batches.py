@@ -100,14 +100,18 @@ def test_low_memory_uses_batched_products_and_only_pads_tail(kind):
     assert ctx.cfg.chol_batch_size == 64
     traced = jax.make_jaxpr(kernel)(walkers[0], ham, ctx, trial)
     scans = [e for e in traced.jaxpr.eqns if e.primitive.name == "scan"]
-    assert len(scans) == 1
-    assert scans[0].params["length"] == 1
-    body = scans[0].params["jaxpr"].jaxpr
-    shapes = [v.aval.shape for e in body.eqns if e.primitive.name == "dot_general"
-              for v in e.outvars]
-    assert (64, sys.nup, sys.norb) in shapes
-    assert (64, sys.ndn, sys.norb) in shapes
-    assert (64, sys.norb, sys.norb) not in shapes
+    # Residual L:M contractions have their own bounded loops. Locate the
+    # doubles loop by its occupied-space products rather than the loop count.
+    doubles_scans = []
+    for scan in scans:
+        body = scan.params["jaxpr"].jaxpr
+        shapes = [v.aval.shape for e in body.eqns if e.primitive.name == "dot_general"
+                  for v in e.outvars]
+        if (64, sys.nup, sys.norb) in shapes and (64, sys.ndn, sys.norb) in shapes:
+            doubles_scans.append(scan)
+            assert (64, sys.norb, sys.norb) not in shapes
+    assert len(doubles_scans) == 1
+    assert doubles_scans[0].params["length"] == 1
 
     def nested_eqns(jaxpr):
         for eqn in jaxpr.eqns:

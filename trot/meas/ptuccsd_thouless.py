@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral
 from typing import Literal
 
 import jax
 import jax.numpy as jnp
 from jax import tree_util
+from jax.sharding import Mesh
 
 from ..core.ops import EstimatorOps, MeasOps, k_energy, k_force_bias
 from ..core.system import System
 from ..ham.chol import HamChol
-from .chol_setup import transform_cholesky
+from .chol_setup import shared_beta_cholesky, transform_cholesky
+from .chol_contract import contract_cholesky
+from ..sharding import cholesky_model_mesh
 from ..trial.ptuccsd_thouless import (
     PtuccsdThoulessTrial,
     greenp_from_green,
@@ -31,7 +34,8 @@ class PtuccsdThoulessMeasCfg:
     mixed_complex_dtype: jnp.dtype = jnp.complex128
     mixed_real_dtype_testing: jnp.dtype = jnp.float32
     mixed_complex_dtype_testing: jnp.dtype = jnp.complex64
-    chol_batch_size: int = 64  # vectors per doubles contraction in low-memory mode
+    chol_batch_size: int = 64  # force bias; also doubles in low-memory mode
+    chol_mesh: Mesh | None = None
 
     def __post_init__(self) -> None:
         if self.memory_mode not in {"low", "high"}:
@@ -69,16 +73,24 @@ def build_ptuccsd_thouless_meas_ctx(
     ham_data: HamChol,
     trial_data: PtuccsdThoulessTrial,
     cfg: PtuccsdThoulessMeasCfg = PtuccsdThoulessMeasCfg(),
+    *,
+    guide_data=None,
+    guide_ctx=None,
 ) -> PtuccsdThoulessMeasCtx:
     if ham_data.basis != "restricted":
         raise ValueError(
             "PT2-UCCSD Thouless measurements require a restricted-basis Hamiltonian."
         )
+    cfg = replace(cfg, chol_mesh=cholesky_model_mesh(ham_data.chol))
     cb = trial_data.mo_coeff_b
     cbh = cb.conj().T
     h1_sym = 0.5 * (ham_data.h1 + ham_data.h1.T.conj())
     h1_b = cbh @ h1_sym @ cb
-    chol_b = transform_cholesky(ham_data.chol, left=cbh, right=cb)
+    chol_b = shared_beta_cholesky(ham_data, trial_data, guide_data, guide_ctx)
+    if chol_b is None:
+        chol_b = transform_cholesky(ham_data.chol, left=cbh, right=cb)
+    else:
+        print("[setup] reusing guide beta-basis Cholesky tensor for PT2-UCCSD", flush=True)
     rot_chol_a = transform_cholesky(ham_data.chol, left=trial_data.mo_t_a.conj().T)
     rot_chol_b = transform_cholesky(chol_b, left=trial_data.mo_t_b.conj().T)
     return PtuccsdThoulessMeasCtx(
@@ -147,15 +159,7 @@ def _chol_contract(
 ) -> jax.Array:
     """Contract a real Cholesky tensor with a complex matrix in mixed precision."""
 
-    chol_r = chol.astype(cfg.mixed_real_dtype)
-    mat_r = jnp.real(mat).astype(cfg.mixed_real_dtype)
-    mat_i = jnp.imag(mat).astype(cfg.mixed_real_dtype)
-    real_part = jnp.einsum("gij,ij->g", chol_r, mat_r, optimize="optimal")
-    imag_part = jnp.einsum("gij,ij->g", chol_r, mat_i, optimize="optimal")
-    imag_unit = jnp.asarray(1.0j, dtype=cfg.mixed_complex_dtype)
-    return real_part.astype(cfg.mixed_complex_dtype) + imag_unit * imag_part.astype(
-        cfg.mixed_complex_dtype
-    )
+    return contract_cholesky(chol, mat, cfg)
 
 
 def _energy_gl_batched(
@@ -746,6 +750,9 @@ def make_ptuccsd_thouless_estimator_ops(
         component_names=("theta", "electronic_0", "h_t"),
         build_estimator_ctx=lambda ham_data, trial_data: build_ptuccsd_thouless_meas_ctx(
             ham_data, trial_data, cfg
+        ),
+        build_estimator_ctx_from_guide=lambda ham_data, trial_data, guide_data, guide_ctx: build_ptuccsd_thouless_meas_ctx(
+            ham_data, trial_data, cfg, guide_data=guide_data, guide_ctx=guide_ctx
         ),
     )
 

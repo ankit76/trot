@@ -3,6 +3,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.sharding import Mesh, PartitionSpec as P
 
@@ -93,3 +94,23 @@ def _transform_local(chol, left, right, *, column_slice, batch_size, model_shard
         start = n_batches * batch_size
         output = lax.dynamic_update_slice_in_dim(output, contract(chol[start:]), start, axis=0)
     return output
+
+
+def shared_beta_cholesky(ham_data, trial_data, guide_data, guide_ctx):
+    """Reuse a guide's beta tensor only for exactly matching orbital bases.
+
+    Contexts must correspond to the supplied Hamiltonian and Cholesky ordering,
+    as required by the mixed-estimator driver. Compare only the small orbital
+    matrices on the host; never read back or compare the Cholesky tensors.
+    """
+    base = getattr(guide_ctx, "base", guide_ctx)
+    chol_b = getattr(base, "chol_b", None)
+    cb = getattr(guide_data, "mo_coeff_b", None)
+    target = trial_data.mo_coeff_b
+    if chol_b is None or cb is None or chol_b.shape != ham_data.chol.shape:
+        return None
+    if cb.shape != target.shape or cb.dtype != target.dtype:
+        return None
+    if cb is not target and not np.array_equal(jax.device_get(cb), jax.device_get(target)):
+        return None
+    return chol_b

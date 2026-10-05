@@ -18,6 +18,7 @@ from ..trial.ucisd_modes import (
     doubles_quadratic,
     overlap_r,
 )
+from .chol_contract import contract_cholesky
 from .ucisd import UcisdMeasCfg, UcisdMeasCtx, _greenp_from_active
 from .ucisd import build_meas_ctx as build_dense_meas_ctx
 
@@ -106,15 +107,7 @@ def _greens_restricted(
 
 def _chol_contract(chol: jax.Array, matrix: jax.Array, cfg: UcisdMeasCfg) -> jax.Array:
     """Contract through real FP32 kernels before reconstructing the result."""
-    chol_r = chol.astype(cfg.mixed_real_dtype)
-    matrix_r = jnp.real(matrix).astype(cfg.mixed_real_dtype)
-    matrix_i = jnp.imag(matrix).astype(cfg.mixed_real_dtype)
-    real_part = jnp.einsum("gij,ij->g", chol_r, matrix_r, optimize="optimal")
-    imag_part = jnp.einsum("gij,ij->g", chol_r, matrix_i, optimize="optimal")
-    imag_unit = jnp.asarray(1.0j, dtype=cfg.mixed_complex_dtype)
-    return real_part.astype(cfg.mixed_complex_dtype) + imag_unit * imag_part.astype(
-        cfg.mixed_complex_dtype
-    )
+    return contract_cholesky(chol, matrix, cfg)
 
 
 def _energy_gl_batched_realimag(

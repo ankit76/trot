@@ -128,6 +128,25 @@ Cholesky model shards are processed locally without gathering the full tensor.
 The full beta-basis Cholesky output is still stored; batching reduces temporary
 workspace, not that persistent storage or production-energy memory.
 
+The mixed-estimator driver reuses the guide's full beta-basis Cholesky tensor
+when building a dense or mode PT2-UCCSD estimator with exactly the same beta
+orbital matrix. This removes one full tensor allocation without changing the
+separate guide and Thouless half rotations. An optional
+`EstimatorOps.build_estimator_ctx_from_guide` hook supplies this reuse; custom
+estimators retain their ordinary builder, and an explicitly supplied estimator
+context is used as-is. Different beta bases fall back to separate construction.
+The compiled block scanner also preserves known context-buffer sharing so
+automatic chunk selection counts each shared input only once.
+
+Dense UCISD and dense/mode PT2-UCCSD force-bias contractions, including combined-K
+and spin-block UCISD modes, cast Cholesky vectors inside batches of
+`chol_batch_size` (default 64). Real and imaginary matrix parts are contracted
+separately, avoiding full FP32/complex Cholesky temporaries and full-sized
+matmul autotuning operands. This batching also applies to their shared residual
+energy contraction helper, independently of the doubles-energy memory mode.
+Model-sharded inputs use local Cholesky batches. Production autotuning and
+matrix-product precision settings are unchanged.
+
 Dense UCISD and PT2-UCCSD measurements likewise accept
 `memory_mode="low", chol_batch_size=64` for restricted/unrestricted walkers.
 This batches the large doubles contractions in groups of Cholesky vectors,

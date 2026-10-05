@@ -209,6 +209,8 @@ def build_ptuccsd_mode_meas_ctx(
     *,
     n_mode_chunks: int = 1,
     component_sampling: PtuccsdModePairSamplingCfg | None = None,
+    guide_data=None,
+    guide_ctx=None,
 ) -> PtuccsdModeMeasCtx:
     """Build the spin-rotated Hamiltonian intermediates used by the mode guide."""
 
@@ -217,7 +219,8 @@ def build_ptuccsd_mode_meas_ctx(
     # Context construction accesses only the two Thouless references and the
     # beta orbital rotation, which the dense and mode trials share exactly.
     base = build_ptuccsd_thouless_meas_ctx(
-        ham_data, cast(PtuccsdThoulessTrial, trial_data), cfg
+        ham_data, cast(PtuccsdThoulessTrial, trial_data), cfg,
+        guide_data=guide_data, guide_ctx=guide_ctx,
     )
     n_chol = int(ham_data.chol.shape[0])
     if component_sampling is not None and component_sampling.chol_head_size > n_chol:
@@ -2209,6 +2212,10 @@ def make_ptuccsd_mode_estimator_ops(
             cfg,
             n_mode_chunks=n_mode_chunks,
             component_sampling=component_sampling,
+        ),
+        build_estimator_ctx_from_guide=lambda ham_data, trial_data, guide_data, guide_ctx: build_ptuccsd_mode_meas_ctx(
+            ham_data, trial_data, cfg, n_mode_chunks=n_mode_chunks,
+            component_sampling=component_sampling, guide_data=guide_data, guide_ctx=guide_ctx,
         ),
         block_components=(
             pair_sampled_ptuccsd_block_components

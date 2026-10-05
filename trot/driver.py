@@ -692,8 +692,15 @@ def make_run_mixed_estimator_blocks(
     guide_meas_ops: MeasOps,
     guide_prop_ops: PropOps,
     estimator_ops: EstimatorOps,
+    shared_context_leaves: tuple[tuple[int, int], ...] = (),
 ) -> Callable:
-    """Build a jitted block scanner for guide-independent estimators."""
+    """Build a jitted block scanner for guide-independent estimators.
+
+    ``shared_context_leaves`` records estimator/guide leaf indices known to
+    alias when this scanner is built. Refer to the guide leaf inside the JIT
+    so XLA sees one argument, rather than counting the shared buffer twice.
+    The driver rebuilds this mapping whenever it rebuilds the scanner.
+    """
 
     @partial(jax.jit, static_argnames=("n_blocks",))
     def run_mixed_estimator_blocks(
@@ -707,6 +714,13 @@ def make_run_mixed_estimator_blocks(
         estimator_ctx,
         n_blocks: int,
     ):
+        if shared_context_leaves:
+            guide_leaves = jax.tree_util.tree_leaves(guide_meas_ctx)
+            estimator_leaves, estimator_tree = jax.tree_util.tree_flatten(estimator_ctx)
+            for estimator_index, guide_index in shared_context_leaves:
+                estimator_leaves[estimator_index] = guide_leaves[guide_index]
+            estimator_ctx = jax.tree_util.tree_unflatten(estimator_tree, estimator_leaves)
+
         def one_block(state, _):
             state, obs = mixed_block_fn(
                 state,
@@ -749,6 +763,16 @@ def _make_run_mixed_estimator_blocks_with_auto_chunks(
 ) -> tuple[QmcParams, Callable]:
     """Build the mixed scanner and optionally select walker chunking."""
 
+    guide_leaf_indices = {
+        id(leaf): i for i, leaf in enumerate(jax.tree_util.tree_leaves(guide_meas_ctx))
+        if isinstance(leaf, jax.Array)
+    }
+    shared_context_leaves = tuple(
+        (i, guide_leaf_indices[id(leaf)])
+        for i, leaf in enumerate(jax.tree_util.tree_leaves(estimator_ctx))
+        if isinstance(leaf, jax.Array) and id(leaf) in guide_leaf_indices
+    )
+
     def build(candidate_params: QmcParams) -> Callable:
         return make_run_mixed_estimator_blocks(
             mixed_block_fn=mixed_block_fn,
@@ -758,6 +782,7 @@ def _make_run_mixed_estimator_blocks_with_auto_chunks(
             guide_meas_ops=guide_meas_ops,
             guide_prop_ops=guide_prop_ops,
             estimator_ops=estimator_ops,
+            shared_context_leaves=shared_context_leaves,
         )
 
     if not params.auto_n_chunks:
@@ -1347,7 +1372,12 @@ def run_mixed_estimator_qmc(
     if guide_meas_ctx is None:
         guide_meas_ctx = guide_meas_ops.build_meas_ctx(ham_data, guide_data)
     if estimator_ctx is None:
-        estimator_ctx = estimator_ops.build_estimator_ctx(ham_data, estimator_data)
+        if estimator_ops.build_estimator_ctx_from_guide is None:
+            estimator_ctx = estimator_ops.build_estimator_ctx(ham_data, estimator_data)
+        else:
+            estimator_ctx = estimator_ops.build_estimator_ctx_from_guide(
+                ham_data, estimator_data, guide_data, guide_meas_ctx
+            )
     if state is None:
         state = guide_prop_ops.init_prop_state(
             sys=sys,
