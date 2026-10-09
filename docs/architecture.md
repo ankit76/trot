@@ -128,6 +128,12 @@ Cholesky model shards are processed locally without gathering the full tensor.
 The full beta-basis Cholesky output is still stored; batching reduces temporary
 workspace, not that persistent storage or production-energy memory.
 
+Restricted PT-CCSD Thouless-mode setup uses the same helper with 256-vector
+batches for `rot_chol[g] = mo_t.conj().T @ chol[g]`. This bounds half-rotation
+workspace and disables autotuning only for that setup compilation, avoiding
+profiling copies of the full Cholesky tensor. The output shape, precision,
+model-axis sharding, mode chunks, and production contractions are unchanged.
+
 The mixed-estimator driver reuses the guide's full beta-basis Cholesky tensor
 when building a dense or mode PT2-UCCSD estimator with exactly the same beta
 orbital matrix. This removes one full tensor allocation without changing the
@@ -146,6 +152,14 @@ matmul autotuning operands. This batching also applies to their shared residual
 energy contraction helper, independently of the doubles-energy memory mode.
 Model-sharded inputs use local Cholesky batches. Production autotuning and
 matrix-product precision settings are unchanged.
+
+Low-memory dense UCISD/PT2-UCCSD doubles loops and the shared force-bias
+helper use one flat Cholesky view for both complete and partial batches.
+Optimization boundaries keep casts and layout changes on the extracted
+batches. Using the original three-dimensional tensor for the tail can make
+GPU layout assignment transpose the entire shared tensor across nested loops,
+including full-sized autotuner profiling buffers. Stored tensors, arithmetic,
+batch-size defaults, and production autotuning are unchanged.
 
 Projected-estimator block-zero reporting has an optional
 `EstimatorOps.initial_components` kernel. PT2-UCCSD modes use it to sum all

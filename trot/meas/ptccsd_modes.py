@@ -48,6 +48,10 @@ from .cisd_modes import (
 from .ptccsd import o_pt_components
 from .pt2ccsd import combine_first_order_energy, project_first_order_energy_terms
 from .pair_sampling import ModelPairSamplingData, local_cholesky_component_head, local_cholesky_tail
+from .chol_setup import transform_cholesky
+
+_PTCCSD_SETUP_CHOL_BATCH_SIZE = 256
+
 
 @dataclass(frozen=True)
 class PtccsdModeMeasCfg:
@@ -336,11 +340,10 @@ def build_ptccsd_thouless_mode_meas_ctx(
             f"chol_head_size must not exceed the number of Cholesky vectors ({n_chol})."
         )
     meas_ctx = PtccsdThoulessModeMeasCtx(
-        rot_chol=jnp.einsum(
-            "pi,gpq->giq",
-            trial_data.mo_t.conj(),
+        rot_chol=transform_cholesky(
             ham_data.chol,
-            optimize="optimal",
+            left=trial_data.mo_t.conj().T,
+            batch_size=_PTCCSD_SETUP_CHOL_BATCH_SIZE,
         ),
         reference_chol_scores=jnp.empty((0,), dtype=jnp.float64),
         chol_head_indices=jnp.empty((0,), dtype=jnp.int32),

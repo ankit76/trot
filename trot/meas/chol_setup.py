@@ -18,6 +18,7 @@ def transform_cholesky(
     left: jax.Array | None = None,
     right: jax.Array | None = None,
     column_slice: tuple[int, int] | None = None,
+    batch_size: int = SETUP_CHOL_BATCH_SIZE,
 ) -> jax.Array:
     """Apply left/right orbital matrices without a full-Cholesky workspace.
 
@@ -26,7 +27,8 @@ def transform_cholesky(
     This setup policy is independent of production energy batching/precision.
     """
     return _transform_cholesky(
-        chol, left, right, column_slice=column_slice, mesh=cholesky_model_mesh(chol)
+        chol, left, right, column_slice=column_slice, batch_size=batch_size,
+        mesh=cholesky_model_mesh(chol),
     )
 
 

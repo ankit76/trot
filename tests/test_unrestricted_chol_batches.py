@@ -79,7 +79,7 @@ def _ops(kind, sys, mode, mixed=True, batch_size=64):
 @pytest.mark.parametrize("kind", ["ucisd", "ptuccsd"])
 @pytest.mark.parametrize("walker_kind", ["restricted", "unrestricted"])
 @pytest.mark.parametrize("mixed", [False, True])
-@pytest.mark.parametrize("nchol,batch_size", [(7, 1), (8, 4), (7, 3), (7, 7), (7, 64), (67, 64)])
+@pytest.mark.parametrize("nchol,batch_size", [(7, 1), (8, 4), (7, 3), (7, 7), (7, 64), (67, 64), (32, 16), (33, 16)])
 def test_batched_doubles_match_all_choleskies(kind, walker_kind, mixed, nchol, batch_size):
     sys, ham, trial, walkers = _case(kind, walker_kind, nchol)
     results = []
@@ -144,3 +144,18 @@ def test_factories_retain_high_memory_default(factory):
 def test_invalid_batch_size_is_rejected(factory, size):
     with pytest.raises(ValueError, match="positive integer"):
         factory(System(norb=6, nelec=(3, 2), walker_kind="restricted"), chol_batch_size=size)
+
+
+@pytest.mark.parametrize("kind", ["ucisd", "ptuccsd"])
+@pytest.mark.parametrize("n_chunks", [2, 3])
+def test_sixteen_cholesky_batches_with_walker_remainder(kind, n_chunks):
+    from trot.walkers import vmap_chunked
+    sys, ham, trial, walkers = _case(kind, nchol=33)
+    walkers = jnp.concatenate((walkers, walkers, walkers[:1]), axis=0)
+    low_kernel, low_ctx = _ops(kind, sys, "low", batch_size=16)
+    high_kernel, high_ctx = _ops(kind, sys, "high", batch_size=16)
+    batched = jax.jit(vmap_chunked(low_kernel, n_chunks, in_axes=(0, None, None, None)))
+    actual = batched(walkers, ham, low_ctx(ham, trial), trial)
+    expected = jax.jit(jax.vmap(high_kernel, in_axes=(0, None, None, None)))(
+        walkers, ham, high_ctx(ham, trial), trial)
+    np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=0)

@@ -43,14 +43,24 @@ def _contract_local(chol, matrix, *, cfg, model_sharded=False):
         output = lax.pcast(output, ("model",), to="varying")
     nfull, remainder = divmod(nchol, batch_size)
 
+    # Keep a single layout across the loop and its remainder. Slicing a
+    # 1D view also prevents layout assignment from reordering all Choleskies.
+    flat_chol = lax.optimization_barrier(chol.reshape(-1))
+    row_size = chol.shape[1] * chol.shape[2]
+
     def body(index, output):
-        block = lax.dynamic_slice_in_dim(chol, index * batch_size, batch_size, axis=0)
-        return lax.dynamic_update_slice_in_dim(output, contract(block), index * batch_size, axis=0)
+        block = lax.dynamic_slice_in_dim(
+            flat_chol, index * batch_size * row_size, batch_size * row_size,
+        ).reshape((batch_size,) + chol.shape[1:])
+        values = contract(lax.optimization_barrier(block))
+        return lax.dynamic_update_slice_in_dim(output, values, index * batch_size, axis=0)
 
     output = lax.fori_loop(0, nfull, body, output)
     if remainder:
         start = nfull * batch_size
-        output = lax.dynamic_update_slice_in_dim(output, contract(chol[start:]), start, axis=0)
+        tail = flat_chol[start * row_size :].reshape((remainder,) + chol.shape[1:])
+        values = contract(lax.optimization_barrier(tail))
+        output = lax.dynamic_update_slice_in_dim(output, values, start, axis=0)
     return output
 
 

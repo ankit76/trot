@@ -702,12 +702,22 @@ def energy_kernel_uw_rh(
         batch_size = cfg.chol_batch_size
         nfull, remainder = divmod(nchol, batch_size)
 
+        # All batches, including the tail, must use the same flat view.
+        # Otherwise GPU layout assignment can transpose the full Cholesky
+        # tensor outside the loop, defeating the bounded workspace.
+        flat_tensors = jax.lax.optimization_barrier(
+            tuple(tensor.reshape(-1) for tensor in chol_tensors)
+        )
+        row_sizes = tuple(tensor.shape[1] * tensor.shape[2] for tensor in chol_tensors)
+
         def accumulate(index, carry):
             batches = tuple(
-                jax.lax.dynamic_slice_in_dim(tensor, index * batch_size, batch_size, axis=0)
-                for tensor in chol_tensors
+                jax.lax.dynamic_slice_in_dim(
+                    flat, index * batch_size * row_size, batch_size * row_size,
+                ).reshape((batch_size,) + tensor.shape[1:])
+                for flat, row_size, tensor in zip(flat_tensors, row_sizes, chol_tensors)
             )
-            values = contract_doubles(*batches)
+            values = contract_doubles(*jax.lax.optimization_barrier(batches))
             return tuple(old + value for old, value in zip(carry, values))
 
         zeros = (
@@ -718,9 +728,12 @@ def energy_kernel_uw_rh(
         if remainder:
             # Pad only the final partial batch, never the full Hamiltonian.
             padding = ((0, batch_size - remainder), (0, 0), (0, 0))
-            tail = contract_doubles(
-                *(jnp.pad(tensor[nfull * batch_size :], padding) for tensor in chol_tensors)
+            batches = tuple(
+                jnp.pad(flat[nfull * batch_size * row_size :].reshape(
+                    (remainder,) + tensor.shape[1:]), padding)
+                for flat, row_size, tensor in zip(flat_tensors, row_sizes, chol_tensors)
             )
+            tail = contract_doubles(*jax.lax.optimization_barrier(batches))
             values = tuple(old + value for old, value in zip(values, tail))
         e2_2_2_2, e2_2_3 = values
 
