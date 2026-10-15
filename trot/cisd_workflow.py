@@ -72,9 +72,11 @@ class CisdPairSamplingConfig:
     """Automatic walker--Cholesky pair-sampling policy.
 
     The detailed proposal and batching choices intentionally live here rather
-    than as flat :class:`Afqmc` flags.  The requested final error is supplied
-    to ``kernel(target_error=...)`` and is consumed by the existing tuning
-    hook after equilibration.
+    than as flat :class:`Afqmc` flags. After equilibration, the tail-noise limit
+    is ``target_tail_std_fraction`` times the standard deviation of the exact
+    calibration-population energies. ``kernel(target_error=...)`` controls
+    stopping independently. ``final_error_sampling_fraction`` is retained for
+    input compatibility but no longer affects tuning.
     """
 
     initial_head_fraction: float = 0.125

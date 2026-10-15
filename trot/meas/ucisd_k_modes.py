@@ -1152,9 +1152,8 @@ def retune_ucisd_k_mode_pair_sampling(
         raise ValueError("Local Cholesky sampling requires frozen settings (no automatic retuning).")
     if meas_ctx.energy_sampling is not None and meas_ctx.energy_sampling.sample_local_walkers:
         raise ValueError("Local walker sampling currently requires frozen settings (no retuning).")
-    del equilibration_weights
+    del equilibration_energies, equilibration_weights
     population_stats = []
-    additional_equilibration_energies = []
     for population_index in range(tuning_cfg.tuning_population_count):
         if population_index > 0:
             spacing = tuning_cfg.tuning_population_spacing_blocks
@@ -1162,11 +1161,8 @@ def retune_ucisd_k_mode_pair_sampling(
                 f"[sampling] advancing {spacing} calibration blocks before "
                 f"population {population_index + 1}/{tuning_cfg.tuning_population_count}."
             )
-            state, scalars, _ = advance_blocks(state, n_blocks=spacing)
+            state, _, _ = advance_blocks(state, n_blocks=spacing)
             jax.block_until_ready(state)
-            additional_equilibration_energies.extend(
-                np.asarray(jax.device_get(scalars["energy"]), dtype=np.float64).tolist()
-            )
 
         print(
             "[sampling] streaming UCISD-K-mode population statistics: "
@@ -1197,39 +1193,16 @@ def retune_ucisd_k_mode_pair_sampling(
         )
 
     stats = average_ucisd_k_mode_population_statistics(population_stats)
-    equilibration_values = np.asarray(
-        jax.device_get(equilibration_energies),
+    snapshot_energies = np.asarray(
+        [population.exact_block_energy_ha for population in population_stats],
         dtype=np.float64,
     )
-    if additional_equilibration_energies:
-        equilibration_values = np.concatenate(
-            (
-                equilibration_values,
-                np.asarray(additional_equilibration_energies, dtype=np.float64),
-            )
-        )
-    late_equilibration_values = equilibration_values[equilibration_values.size // 2 :]
-    late_equilibration_std = (
-        float(np.std(late_equilibration_values, ddof=1))
-        if late_equilibration_values.size > 1
-        else float("nan")
-    )
-    calibration_std = late_equilibration_std
-    calibration_source = "late equilibration block standard deviation"
-    has_final_error_target = tuning_cfg.final_error_target_ha is not None or (
-        target_error is not None and target_error > 0.0
-    )
-    if (
-        tuning_cfg.target_tail_std_ha is None
-        and not has_final_error_target
-        and (not np.isfinite(calibration_std) or calibration_std <= 0.0)
-    ):
+    if snapshot_energies.size > 1:
+        calibration_std = float(np.std(snapshot_energies, ddof=1))
+        calibration_source = "exact calibration-population standard deviation"
+    else:
         calibration_std = stats.independent_population_std_ha
         calibration_source = "independent population standard deviation fallback"
-        print(
-            "[sampling] late-equilibration standard deviation is unavailable; "
-            "using the independent-population estimate for the relative target."
-        )
 
     selected = select_ucisd_k_mode_pair_sampling(
         stats,
@@ -1264,7 +1237,7 @@ def retune_ucisd_k_mode_pair_sampling(
         f"seconds={stats.wall_seconds:.1f}, "
         f"final_exact_snapshot_energy={stats.exact_block_energy_ha:.10f} Ha, "
         f"independent_population_std={stats.independent_population_std_ha:.3e} Ha, "
-        f"late_equilibration_block_std={late_equilibration_std:.3e} Ha."
+        f"calibration_std={calibration_std:.3e} Ha."
     )
     print(
         f"[sampling] selected {guide_label} estimator: "

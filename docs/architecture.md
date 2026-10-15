@@ -565,6 +565,18 @@ afqmc.walker_kind = "restricted"
 energy, error = afqmc.kernel(target_error=2.0e-4)
 ```
 
+Automatic pair-sampling tuning uses the standard deviation of the deterministic
+population energies already evaluated during calibration. Its default tail-noise
+limit is `target_tail_std_fraction=0.35` times that spread, independent of
+`n_blocks` and `target_error`. The existing pair-work estimate selects the
+deterministic head size and tail sample count; no extra calibration populations
+or timing sweep are added. `target_error` controls production stopping only.
+Low-level tuning configs retain the absolute override `target_tail_std_ha`.
+The legacy `final_error_target_ha` and `final_error_sampling_fraction` tuning
+fields remain accepted but no longer affect sampling. With only one calibration
+population, CISD/UCISD use the deterministic independent-walker estimate;
+PT estimators require at least two populations or an absolute override.
+
 Keeping the raw amplitudes makes a later change in compression policy
 reproducible without rerunning CC. Derived representations are keyed by the
 complete `CisdModeConfig`, so several cutoffs can coexist in one staged file.

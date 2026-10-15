@@ -1864,7 +1864,12 @@ def retune_ptuccsd_mode_pair_sampling(
 
     if estimator_ctx.model_sampling is not None:
         raise ValueError("Local Cholesky sampling requires frozen settings (no automatic retuning).")
-    del guide_meas_ctx
+    del guide_meas_ctx, equilibration_components, equilibration_weights
+    if tuning_cfg.tuning_population_count < 2 and tuning_cfg.target_tail_std_ha is None:
+        raise ValueError(
+            "PT-UCCSD pair tuning requires at least two deterministic calibration "
+            "populations or target_tail_std_ha."
+        )
     population_stats = []
     for population_index in range(tuning_cfg.tuning_population_count):
         if population_index > 0:
@@ -1920,36 +1925,8 @@ def retune_ptuccsd_mode_pair_sampling(
         calibration_std = float(np.std(snapshot_energies, ddof=1))
         calibration_source = "exact calibration-population standard deviation"
     else:
-        equil_components_np = np.asarray(jax.device_get(equilibration_components))
-        equil_weights_np = np.asarray(jax.device_get(equilibration_weights))
-        finite = np.isfinite(equil_weights_np) & np.all(
-            np.isfinite(equil_components_np), axis=1
-        )
-        proxy = np.real(
-            np.asarray(
-                combine_first_order_energy(
-                    ham_data.h0,
-                    jnp.asarray(equil_components_np[finite]),
-                )
-            )
-        )
-        late_proxy = proxy[proxy.size // 2 :]
-        calibration_std = (
-            float(np.std(late_proxy, ddof=1)) if late_proxy.size > 1 else float("nan")
-        )
-        calibration_source = "late equilibration projected-energy standard deviation"
-
-    has_absolute_target = tuning_cfg.target_tail_std_ha is not None or (
-        tuning_cfg.final_error_target_ha is not None
-        or (target_error is not None and target_error > 0.0)
-    )
-    if not has_absolute_target and (
-        not np.isfinite(calibration_std) or calibration_std <= 0.0
-    ):
-        raise ValueError(
-            "PT-UCCSD pair tuning requires multiple calibration populations, a usable "
-            "equilibration variance, or an absolute/final-error target."
-        )
+        calibration_std = float("nan")
+        calibration_source = "unavailable (one calibration population)"
     selected = select_ptuccsd_mode_pair_sampling(
         stats,
         tuning_cfg,
@@ -1979,6 +1956,7 @@ def retune_ptuccsd_mode_pair_sampling(
         f"pair_sample_size={selected.sampling.pair_sample_size}, "
         f"tail_std={selected.estimated_tail_std_ha:.3e} Ha, "
         f"target={selected.target_tail_std_ha:.3e} Ha, "
+        f"target_source={selected.target_tail_std_source}, "
         f"walker_guide={selected.sampling.walker_guide_policy}, "
         f"phase_coherence={stats.phase_coherence:.3e}, "
         f"work_proxy={selected.estimated_pair_evaluations} pairs."

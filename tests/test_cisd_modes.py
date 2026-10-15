@@ -1612,7 +1612,7 @@ def test_population_tuner_averages_temporal_second_moments_and_conditional_varia
     assert selected.cross_validation_fold_count == 2
 
 
-def test_population_tuner_uses_held_out_population_variance_and_final_error_budget():
+def test_population_tuner_uses_held_out_variance_and_population_relative_budget():
     population_seconds = np.asarray(
         [[100.0, 1.0], [1.0, 100.0]],
         dtype=np.float64,
@@ -1653,10 +1653,10 @@ def test_population_tuner_uses_held_out_population_variance_and_final_error_budg
     assert selected.cross_validation_fold_count == 2
     np.testing.assert_allclose(
         selected.target_tail_std_ha,
-        0.2 * 7.0e-4 * np.sqrt(1000),
+        0.35 * stats.independent_population_std_ha,
     )
     assert selected.target_tail_std_source == (
-        "0.200 x final error 7.000e-04 Ha x sqrt(1000 blocks)"
+        "0.350 x independent population standard deviation"
     )
 
 

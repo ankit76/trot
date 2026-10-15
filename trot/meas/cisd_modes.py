@@ -186,10 +186,12 @@ class CisdModePairTuningCfg:
     variance validation without additional AFQMC blocks.
 
     ``target_tail_std_ha`` is the highest-priority target override. Otherwise
-    a requested final error, supplied here or to the driver, is converted to a
-    per-block sampling budget using ``final_error_sampling_fraction`` and the
-    planned production length. The late-equilibration relative target remains
-    a fallback when neither is available.
+    ``target_tail_std_fraction`` multiplies the standard deviation of the
+    deterministic calibration-population energies. With only one population,
+    the deterministic independent-walker estimate supplies a rough fallback.
+    Production length and the driver's stopping target do not affect sampling.
+    ``final_error_target_ha`` and ``final_error_sampling_fraction`` are retained
+    for input compatibility but no longer set the sampling budget.
     """
 
     guide_policy: Literal["population_rms", "hf"] = "population_rms"
@@ -1477,7 +1479,13 @@ def select_cisd_mode_pair_sampling(
     final_error_target_ha: float | None = None,
     n_blocks: int | None = None,
 ) -> CisdModePairTuningResult:
-    """Choose the least pair work that meets a cross-validated noise target."""
+    """Choose the least pair work that meets a cross-validated noise target.
+
+    ``final_error_target_ha`` and ``n_blocks`` are accepted for compatibility;
+    the tail-noise budget depends only on calibration or an absolute override.
+    """
+
+    del final_error_target_ha, n_blocks
 
     if n_walkers <= 0:
         raise ValueError("n_walkers must be positive.")
@@ -1534,32 +1542,14 @@ def select_cisd_mode_pair_sampling(
     calibration_std = float(
         stats.independent_population_std_ha if calibration_std_ha is None else calibration_std_ha
     )
-    configured_final_error = (
-        cfg.final_error_target_ha
-        if cfg.final_error_target_ha is not None
-        else final_error_target_ha
-    )
     if cfg.target_tail_std_ha is not None:
         target_tail_std = cfg.target_tail_std_ha
         target_source = "absolute override"
-    elif configured_final_error is not None and configured_final_error > 0.0:
-        if n_blocks is None or n_blocks <= 0:
-            raise ValueError(
-                "A positive n_blocks is required to derive the tail target from "
-                "the requested final error."
-            )
-        target_tail_std = (
-            cfg.final_error_sampling_fraction * configured_final_error * math.sqrt(n_blocks)
-        )
-        target_source = (
-            f"{cfg.final_error_sampling_fraction:.3f} x final error "
-            f"{configured_final_error:.3e} Ha x sqrt({n_blocks} blocks)"
-        )
     else:
-        if not np.isfinite(calibration_std) or calibration_std <= 0.0:
+        if not np.isfinite(calibration_std) or calibration_std < 0.0:
             raise ValueError(
-                "A positive finite calibration standard deviation is required when "
-                "neither target_tail_std_ha nor a final-error target is provided."
+                "A nonnegative finite deterministic calibration standard deviation "
+                "is required when target_tail_std_ha is not provided."
             )
         target_tail_std = cfg.target_tail_std_fraction * calibration_std
         target_source = f"{cfg.target_tail_std_fraction:.3f} x {calibration_source}"
@@ -1746,9 +1736,8 @@ def retune_cisd_mode_pair_sampling(
         raise ValueError("Local Cholesky sampling requires frozen settings (no automatic retuning).")
     if meas_ctx.energy_sampling is not None and meas_ctx.energy_sampling.sample_local_walkers:
         raise ValueError("Local walker sampling currently requires frozen settings (no retuning).")
-    del equilibration_weights
+    del equilibration_energies, equilibration_weights
     population_stats = []
-    additional_equilibration_energies = []
     for population_index in range(tuning_cfg.tuning_population_count):
         if population_index > 0:
             spacing = tuning_cfg.tuning_population_spacing_blocks
@@ -1756,11 +1745,8 @@ def retune_cisd_mode_pair_sampling(
                 f"[sampling] advancing {spacing} calibration blocks before "
                 f"population {population_index + 1}/{tuning_cfg.tuning_population_count}."
             )
-            state, scalars, _ = advance_blocks(state, n_blocks=spacing)
+            state, _, _ = advance_blocks(state, n_blocks=spacing)
             jax.block_until_ready(state)
-            additional_equilibration_energies.extend(
-                np.asarray(jax.device_get(scalars["energy"]), dtype=np.float64).tolist()
-            )
 
         print(
             "[sampling] streaming population statistics: "
@@ -1790,39 +1776,16 @@ def retune_cisd_mode_pair_sampling(
             f"statistics_seconds={stats_i.wall_seconds:.1f}."
         )
     stats = average_cisd_mode_population_statistics(population_stats)
-    equilibration_values = np.asarray(
-        jax.device_get(equilibration_energies),
+    snapshot_energies = np.asarray(
+        [population.exact_block_energy_ha for population in population_stats],
         dtype=np.float64,
     )
-    if additional_equilibration_energies:
-        equilibration_values = np.concatenate(
-            (
-                equilibration_values,
-                np.asarray(additional_equilibration_energies, dtype=np.float64),
-            )
-        )
-    late_equilibration_values = equilibration_values[equilibration_values.size // 2 :]
-    late_equilibration_std = (
-        float(np.std(late_equilibration_values, ddof=1))
-        if late_equilibration_values.size > 1
-        else float("nan")
-    )
-    calibration_std = late_equilibration_std
-    calibration_source = "late equilibration block standard deviation"
-    has_final_error_target = tuning_cfg.final_error_target_ha is not None or (
-        target_error is not None and target_error > 0.0
-    )
-    if (
-        tuning_cfg.target_tail_std_ha is None
-        and not has_final_error_target
-        and (not np.isfinite(calibration_std) or calibration_std <= 0.0)
-    ):
+    if snapshot_energies.size > 1:
+        calibration_std = float(np.std(snapshot_energies, ddof=1))
+        calibration_source = "exact calibration-population standard deviation"
+    else:
         calibration_std = stats.independent_population_std_ha
         calibration_source = "independent population standard deviation fallback"
-        print(
-            "[sampling] late-equilibration standard deviation is unavailable; "
-            "using the independent-population estimate for the relative target."
-        )
     selected = select_cisd_mode_pair_sampling(
         stats,
         tuning_cfg,
@@ -1856,7 +1819,7 @@ def retune_cisd_mode_pair_sampling(
         f"seconds={stats.wall_seconds:.1f}, "
         f"final_exact_snapshot_energy={stats.exact_block_energy_ha:.10f} Ha, "
         f"independent_population_std={stats.independent_population_std_ha:.3e} Ha, "
-        f"late_equilibration_block_std={late_equilibration_std:.3e} Ha."
+        f"calibration_std={calibration_std:.3e} Ha."
     )
     print(
         f"[sampling] selected {guide_label} estimator: "
