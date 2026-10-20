@@ -181,14 +181,18 @@ class PtuccsdModeMeasCtx:
 
 
 class PtuccsdModeEnergyCommon(NamedTuple):
-    """Per-walker data independent of the Cholesky component sum."""
+    """Per-walker data with corrections in each spin's ``[C^*, S_v]`` basis.
+
+    ``combo2_coeff`` includes the factor of two in the doubles correction;
+    its physical matrix would be ``[C^*, S_v] @ combo2_coeff @ half_green``.
+    """
 
     half_green_a: jax.Array
     half_green_b: jax.Array
-    greenp_a: jax.Array
-    greenp_b: jax.Array
-    combo2_a: jax.Array
-    combo2_b: jax.Array
+    greenp_coeff_a: jax.Array
+    greenp_coeff_b: jax.Array
+    combo2_coeff_a: jax.Array
+    combo2_coeff_b: jax.Array
     theta: jax.Array
     electronic_0_base: jax.Array
     h_t_base: jax.Array
@@ -786,23 +790,38 @@ def _ptuccsd_mode_energy_common_uw_rh(
 ) -> PtuccsdModeEnergyCommon:
     """Build per-walker data outside the Cholesky component sum."""
 
-    (
-        half_green_a,
-        half_green_b,
-        green_a,
-        green_b,
-        green_occ_a,
-        green_occ_b,
-        greenp_a,
-        greenp_b,
-    ) = _half_green_blocks(walker, trial_data)
     noa, nob = trial_data.nocc
     cfg = meas_ctx.cfg
     h1_a = 0.5 * (ham_data.h1 + ham_data.h1.T.conj())
     h1_b = meas_ctx.h1_b
 
-    e1_0 = jnp.einsum("ij,ij->", h1_a, green_a, optimize="optimal")
-    e1_0 += jnp.einsum("ij,ij->", h1_b, green_b, optimize="optimal")
+    def spin_common(walker_s, mo_t, nvir, h1):
+        reference = mo_t.conj()
+        nocc = mo_t.shape[1]
+        vir = slice(nocc, nocc + nvir)
+        half_green = jnp.linalg.solve((reference.T @ walker_s).T, walker_s.T)
+        green_occ = reference[:nocc, :] @ half_green[:, vir]
+        # P = C^* H_v - S_v = B [H_v; -I], B = [C^*, S_v].
+        # Store coefficients in this small basis, never full G or P.
+        greenp_coeff = jnp.vstack(
+            [half_green[:, vir], -jnp.eye(nvir, dtype=half_green.dtype)]
+        )
+        h1_trial = jnp.vstack([reference.T @ h1, h1[vir, :]])
+        e1 = jnp.einsum(
+            "iq,iq->", h1_trial[:nocc, :], half_green, optimize="optimal"
+        )
+        return half_green, green_occ, greenp_coeff, h1_trial, e1
+
+    half_green_a, green_occ_a, greenp_a, h1_trial_a, e1_a = spin_common(
+        walker[0], trial_data.mo_t_a, trial_data.nvir[0], h1_a
+    )
+    half_green_b, green_occ_b, greenp_b, h1_trial_b, e1_b = spin_common(
+        trial_data.mo_coeff_b.conj().T @ walker[1],
+        trial_data.mo_t_b,
+        trial_data.nvir[1],
+        h1_b,
+    )
+    e1_0 = e1_a + e1_b
 
     applied_a, applied_b = _mode_apply_realimag(
         trial_data,
@@ -816,19 +835,26 @@ def _ptuccsd_mode_energy_common_uw_rh(
     theta += 0.5 * jnp.einsum(
         "pt,pt->", green_occ_b, applied_b, optimize="optimal"
     )
-    combo_a = (greenp_a @ applied_a.T) @ green_a[:noa, :]
-    combo_b = (greenp_b @ applied_b.T) @ green_b[:nob, :]
+    # The physical correction is B @ combo2_coeff @ H. Fold the occupied
+    # reference block into its coefficients, allowing nonidentity occupied
+    # gauges and reference components outside the retained FNO space.
+    combo2_a = 2.0 * (greenp_a @ applied_a.T) @ trial_data.mo_t_a.conj()[:noa, :]
+    combo2_b = 2.0 * (greenp_b @ applied_b.T) @ trial_data.mo_t_b.conj()[:nob, :]
     e1_2 = e1_0 * theta
-    e1_2 -= jnp.einsum("ij,ij->", h1_a, combo_a, optimize="optimal")
-    e1_2 -= jnp.einsum("ij,ij->", h1_b, combo_b, optimize="optimal")
+    e1_2 -= 0.5 * jnp.einsum(
+        "pi,ip->", combo2_a, half_green_a @ h1_trial_a.T, optimize="optimal"
+    )
+    e1_2 -= 0.5 * jnp.einsum(
+        "pi,ip->", combo2_b, half_green_b @ h1_trial_b.T, optimize="optimal"
+    )
 
     return PtuccsdModeEnergyCommon(
         half_green_a=half_green_a,
         half_green_b=half_green_b,
-        greenp_a=greenp_a,
-        greenp_b=greenp_b,
-        combo2_a=2.0 * combo_a,
-        combo2_b=2.0 * combo_b,
+        greenp_coeff_a=greenp_a,
+        greenp_coeff_b=greenp_b,
+        combo2_coeff_a=combo2_a,
+        combo2_coeff_b=combo2_b,
         theta=theta,
         electronic_0_base=e1_0,
         h_t_base=e1_2,
@@ -871,10 +897,12 @@ def _ptuccsd_mode_chol_terms(
     reference_occ_b = trial_data.mo_t_b.conj()[:nob, :].astype(
         cfg.mixed_complex_dtype
     )
-    greenp_a = common.greenp_a.astype(cfg.mixed_complex_dtype)
-    greenp_b = common.greenp_b.astype(cfg.mixed_complex_dtype)
-    combo2_a = common.combo2_a.astype(cfg.mixed_complex_dtype)
-    combo2_b = common.combo2_b.astype(cfg.mixed_complex_dtype)
+    greenp_a = common.greenp_coeff_a.astype(cfg.mixed_complex_dtype)
+    greenp_b = common.greenp_coeff_b.astype(cfg.mixed_complex_dtype)
+    combo2_a = common.combo2_coeff_a.astype(cfg.mixed_complex_dtype)
+    combo2_b = common.combo2_coeff_b.astype(cfg.mixed_complex_dtype)
+    vir_a = slice(noa, noa + trial_data.nvir[0])
+    vir_b = slice(nob, nob + trial_data.nvir[1])
 
     def scalar_term(
         chol_a_i: jax.Array,
@@ -903,31 +931,40 @@ def _ptuccsd_mode_chol_terms(
         e20_i = 0.5 * lg_i * lg_i
         e20_i -= 0.5 * jnp.sum(lg1_a_i * jnp.swapaxes(lg1_a_i, -1, -2))
         e20_i -= 0.5 * jnp.sum(lg1_b_i * jnp.swapaxes(lg1_b_i, -1, -2))
-        lt2g_a_i = _chol_contract(chol_a_i[None, ...], common.combo2_a, cfg)[0]
-        lt2g_b_i = _chol_contract(chol_b_i[None, ...], common.combo2_b, cfg)[0]
-        e221_i = -0.5 * (lt2g_a_i + lt2g_b_i) * lg_i
-
-        gl_half_a_i = _energy_gl_scalar(common.half_green_a, chol_a_i, cfg)
-        gl_half_b_i = _energy_gl_scalar(common.half_green_b, chol_b_i, cfg)
-        lcombo_a_i = jnp.einsum(
-            "pi,ji->pj",
-            rot_chol_a_i.astype(cfg.mixed_complex_dtype),
-            combo2_a,
-            optimize="optimal",
+        # H L^T B = [lg1^T, H L[v, :]^T]. Reuse the occupied block
+        # and compute only retained virtual outputs. The UCC GL helpers
+        # right-multiply their inputs, hence the explicit slice transpose.
+        gl_trial_a_i = jnp.concatenate(
+            [
+                lg1_a_i.T.astype(cfg.mixed_complex_dtype),
+                _energy_gl_scalar(common.half_green_a, chol_a_i[vir_a, :].T, cfg),
+            ],
+            axis=-1,
         )
-        lcombo_b_i = jnp.einsum(
-            "pi,ji->pj",
-            rot_chol_b_i.astype(cfg.mixed_complex_dtype),
-            combo2_b,
-            optimize="optimal",
+        gl_trial_b_i = jnp.concatenate(
+            [
+                lg1_b_i.T.astype(cfg.mixed_complex_dtype),
+                _energy_gl_scalar(common.half_green_b, chol_b_i[vir_b, :].T, cfg),
+            ],
+            axis=-1,
         )
+        gl_combo_a_i = gl_trial_a_i @ combo2_a
+        gl_combo_b_i = gl_trial_b_i @ combo2_b
+        lt2g_i = jnp.trace(gl_combo_a_i) + jnp.trace(gl_combo_b_i)
+        e221_i = -0.5 * lt2g_i * lg_i
         e222_i = 0.5 * (
-            jnp.einsum("pi,pi->", gl_half_a_i, lcombo_a_i, optimize="optimal")
-            + jnp.einsum("pi,pi->", gl_half_b_i, lcombo_b_i, optimize="optimal")
+            jnp.einsum(
+                "ij,ij->", lg1_a_i.astype(cfg.mixed_complex_dtype), gl_combo_a_i,
+                optimize="optimal",
+            )
+            + jnp.einsum(
+                "ij,ij->", lg1_b_i.astype(cfg.mixed_complex_dtype), gl_combo_b_i,
+                optimize="optimal",
+            )
         )
 
-        gl_occ_a_i = reference_occ_a @ gl_half_a_i
-        gl_occ_b_i = reference_occ_b @ gl_half_b_i
+        gl_occ_a_i = reference_occ_a @ gl_trial_a_i
+        gl_occ_b_i = reference_occ_b @ gl_trial_b_i
         glgp_a_i = jnp.einsum(
             "pi,it->pt", gl_occ_a_i, greenp_a, optimize="optimal"
         ).astype(cfg.mixed_complex_dtype_testing)
@@ -983,34 +1020,45 @@ def _ptuccsd_mode_chol_terms(
     e20 -= 0.5 * jnp.sum(
         lg1_b * jnp.swapaxes(lg1_b, -1, -2), axis=(-1, -2)
     )
-    lt2g_a = _chol_contract(chol_a, common.combo2_a, cfg)
-    lt2g_b = _chol_contract(chol_b, common.combo2_b, cfg)
-    e221 = -0.5 * (lt2g_a + lt2g_b) * lg
-
-    gl_half_a = _energy_gl_batched(common.half_green_a, chol_a, cfg)
-    gl_half_b = _energy_gl_batched(common.half_green_b, chol_b, cfg)
-    lcombo_a = jnp.einsum(
-        "gpi,ji->gpj",
-        rot_chol_a.astype(cfg.mixed_complex_dtype),
-        combo2_a,
-        optimize="optimal",
+    gl_trial_a = jnp.concatenate(
+        [
+            jnp.swapaxes(lg1_a, -1, -2).astype(cfg.mixed_complex_dtype),
+            _energy_gl_batched(
+                common.half_green_a, jnp.swapaxes(chol_a[:, vir_a, :], -1, -2), cfg
+            ),
+        ],
+        axis=-1,
     )
-    lcombo_b = jnp.einsum(
-        "gpi,ji->gpj",
-        rot_chol_b.astype(cfg.mixed_complex_dtype),
-        combo2_b,
-        optimize="optimal",
+    gl_trial_b = jnp.concatenate(
+        [
+            jnp.swapaxes(lg1_b, -1, -2).astype(cfg.mixed_complex_dtype),
+            _energy_gl_batched(
+                common.half_green_b, jnp.swapaxes(chol_b[:, vir_b, :], -1, -2), cfg
+            ),
+        ],
+        axis=-1,
     )
+    gl_combo_a = jnp.einsum("giq,qj->gij", gl_trial_a, combo2_a, optimize="optimal")
+    gl_combo_b = jnp.einsum("giq,qj->gij", gl_trial_b, combo2_b, optimize="optimal")
+    lt2g = jnp.trace(gl_combo_a, axis1=-2, axis2=-1)
+    lt2g += jnp.trace(gl_combo_b, axis1=-2, axis2=-1)
+    e221 = -0.5 * lt2g * lg
     e222 = 0.5 * (
-        jnp.einsum("gpi,gpi->g", gl_half_a, lcombo_a, optimize="optimal")
-        + jnp.einsum("gpi,gpi->g", gl_half_b, lcombo_b, optimize="optimal")
+        jnp.einsum(
+            "gij,gij->g", lg1_a.astype(cfg.mixed_complex_dtype), gl_combo_a,
+            optimize="optimal",
+        )
+        + jnp.einsum(
+            "gij,gij->g", lg1_b.astype(cfg.mixed_complex_dtype), gl_combo_b,
+            optimize="optimal",
+        )
     )
 
     gl_occ_a = jnp.einsum(
-        "ij,gjq->giq", reference_occ_a, gl_half_a, optimize="optimal"
+        "ij,gjq->giq", reference_occ_a, gl_trial_a, optimize="optimal"
     )
     gl_occ_b = jnp.einsum(
-        "ij,gjq->giq", reference_occ_b, gl_half_b, optimize="optimal"
+        "ij,gjq->giq", reference_occ_b, gl_trial_b, optimize="optimal"
     )
     glgp_a = jnp.einsum(
         "gpi,it->gpt", gl_occ_a, greenp_a, optimize="optimal"

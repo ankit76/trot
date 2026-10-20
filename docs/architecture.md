@@ -165,6 +165,26 @@ kernel. The Hamiltonian and walkers retain their full orbital space. These
 changes alter contraction order and storage, with no new truncation; precision
 settings and the exponential-guide force-bias algorithm are unchanged.
 
+The combined-K UCISD guide (dense K or K modes) uses compact
+`nocc_spin + nvir_fno_spin` correction rows separately in the alpha and beta
+bases. Force bias contracts these rectangular corrections against the matching
+slices of `ham.chol` and the already stored `chol_b`. It no longer rotates a
+full beta correction into the alpha basis for each walker.
+
+PT-UCCSD mode energy uses the same coefficient representation as restricted
+PT-CCSD, independently for each spin. `greenp_coeff_a/b` have shapes
+`(nocc_spin + nvir_fno_spin, nvir_fno_spin)`; `combo2_coeff_a/b` have shapes
+`(nocc_spin + nvir_fno_spin, nocc_spin)` and include the factor of two in the
+doubles correction. The physical correction is
+`B_spin @ combo2_coeff_spin @ half_green_spin`. Full orbital-square Green
+matrices and doubles corrections are not constructed by this energy path.
+Both high- and low-memory kernels reuse the occupied reference contractions,
+compute only retained virtual Green--Cholesky outputs, and share those products
+between the connected energy terms. The combined-mode application still
+couples alpha and beta amplitudes. Deterministic evaluation, calibration, and
+global/local pair sampling all use these kernels. This does not remove the
+full beta-basis Hamiltonian stored in the context.
+
 The mixed-estimator driver reuses the guide's full beta-basis Cholesky tensor
 when building a dense or mode PT2-UCCSD estimator with exactly the same beta
 orbital matrix. This removes one full tensor allocation without changing the
@@ -537,10 +557,11 @@ implemented for unrestricted trials.
 Dense UCISD, combined-K and spin-block modes, and dense/mode PT2-UCCSD use
 compact excitation dimensions. For retained counts $v_\alpha$ and $v_\beta$,
 the combined mode pair dimension is $o_\alpha v_\alpha + o_\beta v_\beta$;
-amplitudes are not padded to the full virtual space. Green-function and
-Hamiltonian contractions keep full orbital rows and only the retained trial
-virtual columns where appropriate. Dense Cholesky batching and mode pair
-sampling use the same compact spaces.
+amplitudes are not padded to the full virtual space. Hamiltonians and walker
+orbitals remain full-sized. Combined-K UCISD force bias uses compact correction
+rows; PT-UCCSD mode energy keeps its doubles corrections factorized and reuses
+occupied contractions, as described above. Dense Cholesky batching and mode
+pair sampling use the same compact excitation spaces.
 
 For low-level PT2-UCCSD construction, supply the compact raw `t1a`, `t1b`,
 `t2aa`, `t2ab`, `t2bb` amplitudes and the **full** `mo_coeff_b` from the staged

@@ -1,6 +1,8 @@
 """Compact spin-specific trial spaces in the unchanged full Hamiltonian."""
 
 from importlib import import_module
+from dataclasses import replace
+from types import SimpleNamespace
 
 from trot import config
 
@@ -17,6 +19,8 @@ from trot.trial import ptuccsd_thouless, ptuccsd_modes
 from trot.meas import ucisd as ci_meas
 from trot.meas import ptuccsd_thouless as pt_meas
 from trot.meas import ptuccsd_modes as pt_mode_meas
+from trot.meas import ucisd_k as ci_k_meas
+from trot.meas import ucisd_k_modes as ci_mode_meas
 
 
 def _inputs(nva=3, nvb=2):
@@ -219,6 +223,200 @@ def test_compact_pt_dense_and_modes_match_zero_padded(memory_mode, nva, nvb):
         cached, sys, mixed_precision=False
     )
     _assert(jax.jit(ptuccsd_modes.overlap_r)(w, restored), ptuccsd_thouless.overlap_r(w, full))
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("nva,nvb", [(3, 2), (2, 0)])
+def test_k_mode_force_bias_contracts_only_native_fno_rows(mixed, nva, nvb, monkeypatch):
+    data, padded, w, ham, sys = _inputs(nva, nvb)
+    values, vectors = np.linalg.eigh(
+        ucisd_k.build_ucisd_kernel(data["ci2aa"], data["ci2ab"], data["ci2bb"])
+    )
+    trial = ucisd_k_modes.make_ucisd_k_mode_trial_data(
+        dict(data, c1a=data["ci1a"], c1b=data["ci1b"], eigenvalues=values, modes=vectors.T),
+        sys, mixed_precision=mixed,
+    )
+    cfg = _cfg(ci_meas.UcisdMeasCfg)
+    if mixed:
+        cfg = replace(
+            cfg, mixed_real_dtype=jnp.float32, mixed_complex_dtype=jnp.complex64,
+            mixed_real_dtype_testing=jnp.float32, mixed_complex_dtype_testing=jnp.complex64,
+        )
+    ctx = ci_mode_meas.build_meas_ctx(ham, trial, cfg=cfg, n_mode_chunks=3)
+    full = ucisd.make_ucisd_trial_data(padded, sys)
+    fctx = ci_meas.build_meas_ctx(ham, full, _cfg(ci_meas.UcisdMeasCfg))
+    expected = ci_meas.force_bias_kernel_rw_rh(w, ham, fctx, full)
+    contract = ci_k_meas._separate_spin_chol_contract
+    calls = []
+
+    def compact_contract(la, lb, ma, mb, cfg):
+        # Resource regression: both corrections and their Hamiltonian slices
+        # must use native spin rows, not full squares rotated to the alpha basis.
+        calls.append((ma.shape, mb.shape))
+        assert ma.shape == (3 + nva, 7)
+        assert mb.shape == (2 + nvb, 7)
+        assert la.shape[1:] == ma.shape and lb.shape[1:] == mb.shape
+        return contract(la, lb, ma, mb, cfg)
+
+    monkeypatch.setattr(ci_k_meas, "_separate_spin_chol_contract", compact_contract)
+    actual = jax.jit(ci_mode_meas.force_bias_kernel_rw_rh)(w, ham, ctx, trial)
+    assert calls
+    tolerance = 2e-6 if mixed else 2e-10
+    np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("memory_mode", ["high", "low"])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("general_reference", [False, True])
+@pytest.mark.parametrize("nva,nvb", [(3, 2), (2, 0)])
+def test_compact_pt_energy_matches_full_green_oracle(
+    memory_mode, mixed, general_reference, nva, nvb, monkeypatch,
+):
+    data, _, w, ham, sys = _inputs(nva, nvb)
+    trial = ptuccsd_modes.make_ptuccsd_thouless_mode_trial_data(
+        _pt_data(data), sys, mixed_precision=mixed
+    )
+    # Check compressed modes as well as the full-rank dense comparison above.
+    trial = replace(trial, eigenvalues=trial.eigenvalues[:5], modes=trial.modes[:5])
+    if general_reference:
+        def reference(mo, nv):
+            no = mo.shape[1]
+            mo = mo.astype(jnp.complex128).at[no + nv :, :].set(0.02 + 0.01j)
+            gauge = (1.03 + 0.04j) * jnp.eye(no) + (0.01 - 0.02j) * jnp.ones((no, no))
+            return mo @ gauge
+
+        trial = replace(
+            trial, mo_t_a=reference(trial.mo_t_a, nva), mo_t_b=reference(trial.mo_t_b, nvb)
+        )
+    cfg = _cfg(pt_mode_meas.PtuccsdModeMeasCfg, memory_mode)
+    if mixed:
+        cfg = replace(
+            cfg, mixed_real_dtype=jnp.float32, mixed_complex_dtype=jnp.complex64,
+            mixed_real_dtype_testing=jnp.float32, mixed_complex_dtype_testing=jnp.complex64,
+        )
+    ctx = pt_mode_meas.build_ptuccsd_mode_meas_ctx(ham, trial, cfg, n_mode_chunks=3)
+    walker = (w, w[:, :2] + 0.015j * w[:, 1:3])
+    expected = jax.jit(pt_mode_meas._energy_components_uw_rh_reference)(
+        walker, ham, ctx, trial
+    )
+    gl_name = "_energy_gl_scalar" if memory_mode == "low" else "_energy_gl_batched"
+    gl = getattr(pt_mode_meas, gl_name)
+    calls = []
+
+    def compact_gl(half_green, chol, cfg):
+        nv = nva if half_green.shape[0] == 3 else nvb
+        calls.append(chol.shape)
+        assert chol.shape[-2:] == (7, nv)
+        return gl(half_green, chol, cfg)
+
+    def no_full_green(*args):
+        pytest.fail("Production PT energy must not construct full Green matrices.")
+
+    monkeypatch.setattr(pt_mode_meas, gl_name, compact_gl)
+    monkeypatch.setattr(pt_mode_meas, "_half_green_blocks", no_full_green)
+    actual = jax.jit(pt_mode_meas._energy_components_uw_rh)(walker, ham, ctx, trial)
+    assert calls
+    tolerance = 2e-6 if mixed else 2e-10
+    np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def test_c60_pt_common_storage_is_factorized():
+    # Trace shapes only; allocating these C60 arrays is unnecessary.
+    nw, no, nva, nvb, norb, rank, nx = 400, 120, 167, 166, 780, 1000, 5126
+    shape = jax.ShapeDtypeStruct
+    trial = ptuccsd_modes.PtuccsdThoulessModeTrial(
+        mo_t_a=shape((norb, no), jnp.float64),
+        mo_t_b=shape((norb, no), jnp.float64),
+        mo_coeff_b=shape((norb, norb), jnp.float64),
+        eigenvalues=shape((rank,), jnp.float64),
+        modes=shape((rank, no * (nva + nvb)), jnp.float32),
+        nvir_t_outer=(norb - no - nva, norb - no - nvb),
+    )
+    ham = HamChol(
+        shape((), jnp.float64), shape((norb, norb), jnp.float64),
+        shape((nx, norb, norb), jnp.float64),
+    )
+
+    def common(walkers, ham, trial):
+        ctx = SimpleNamespace(h1_b=ham.h1, cfg=pt_mode_meas.PtuccsdModeMeasCfg())
+        return jax.vmap(
+            pt_mode_meas._ptuccsd_mode_energy_common_rw_rh, in_axes=(0, None, None, None)
+        )(walkers, ham, ctx, trial)
+
+    result = jax.eval_shape(common, shape((nw, norb, no), jnp.complex128), ham, trial)
+    assert result.half_green_a.shape == result.half_green_b.shape == (nw, no, norb)
+    for spin, nv in (("a", nva), ("b", nvb)):
+        assert getattr(result, "greenp_coeff_" + spin).shape == (nw, no + nv, nv)
+        assert getattr(result, "combo2_coeff_" + spin).shape == (nw, no + nv, no)
+    stored_bytes = sum(a.size * a.dtype.itemsize for a in jax.tree.leaves(result))
+    previous_bytes = nw * (2 * no * norb + norb * (nva + nvb) + 2 * norb**2 + 3) * 16
+    assert stored_bytes < previous_bytes / 4
+
+
+@pytest.mark.parametrize("n_data,n_model", [(1, 4), (2, 2)])
+def test_compact_pt_local_head_and_sharded_guide_match_oracles(n_data, n_model):
+    if jax.local_device_count() < 4:
+        pytest.skip("Requires four logical CPU devices or GPUs.")
+    from jax.sharding import Mesh
+    from trot.meas.pair_sampling import with_local_cholesky_sampling
+    from trot.sharding import plan_cholesky_layout, replicate, shard_cholesky_layout, shard_first_axis
+
+    data, padded, w, ham, sys = _inputs()
+    trial = ptuccsd_modes.make_ptuccsd_thouless_mode_trial_data(
+        _pt_data(data), sys, mixed_precision=False
+    )
+    full = ptuccsd_thouless.make_ptuccsd_thouless_trial_data(_pt_data(padded), sys)
+    fctx = pt_meas.build_ptuccsd_thouless_meas_ctx(ham, full, _cfg(pt_meas.PtuccsdThoulessMeasCfg))
+    walkers = jnp.stack([w, w + 0.01j, w - 0.02, w + 0.01])
+    weights = jnp.asarray([1.0 + 0.2j, 0.7 - 0.1j, 1.3 + 0.4j, 0.9 - 0.3j])
+    expected = jax.vmap(
+        pt_meas.components_ptuccsd_thouless_rw_rh, in_axes=(0, None, None, None)
+    )(walkers, ham, fctx, full)
+    mesh = Mesh(np.array(jax.local_devices()[:4]).reshape(n_data, n_model), ("data", "model"))
+    nx = ham.chol.shape[0]
+    layout = plan_cholesky_layout(nx, n_model, np.arange(nx), [], [])
+    sharded_ham = HamChol(
+        replicate(ham.h0, mesh), replicate(ham.h1, mesh),
+        shard_cholesky_layout(np.asarray(ham.chol), mesh, layout),
+    )
+    trial = jax.tree.map(lambda a: replicate(a, mesh), trial)
+    ctx = pt_mode_meas.build_ptuccsd_mode_meas_ctx(
+        sharded_ham, trial, _cfg(pt_mode_meas.PtuccsdModeMeasCfg), n_mode_chunks=3
+    )
+    sampling = pt_mode_meas.PtuccsdModePairSamplingCfg(nx, 16, head_chol_batch_size=2)
+    ctx = with_local_cholesky_sampling(replace(ctx, component_sampling=sampling), layout, mesh)
+    result = jax.jit(pt_mode_meas.pair_sampled_ptuccsd_block_components, static_argnums=3)(
+        shard_first_axis(walkers, mesh), shard_first_axis(weights, mesh),
+        jax.random.PRNGKey(601), 2, sharded_ham, ctx, trial,
+    )
+    _assert(result.weight, weights.sum())
+    _assert(result.numerator, (weights[:, None] * expected).sum(axis=0))
+
+    values, vectors = np.linalg.eigh(
+        ucisd_k.build_ucisd_kernel(data["ci2aa"], data["ci2ab"], data["ci2bb"])
+    )
+    guide = ucisd_k_modes.make_ucisd_k_mode_trial_data(
+        dict(data, c1a=data["ci1a"], c1b=data["ci1b"], eigenvalues=values, modes=vectors.T),
+        sys, mixed_precision=False,
+    )
+    guide = jax.tree.map(lambda a: replicate(a, mesh), guide)
+    gctx = ci_mode_meas.build_meas_ctx(
+        sharded_ham, guide, cfg=_cfg(ci_meas.UcisdMeasCfg), n_mode_chunks=3
+    )
+    force_bias = jax.jit(jax.vmap(ci_mode_meas.force_bias_kernel_rw_rh, in_axes=(0, None, None, None)))(
+        shard_first_axis(walkers, mesh), sharded_ham, gctx, guide
+    )
+    dense = ucisd.make_ucisd_trial_data(padded, sys)
+    dctx = ci_meas.build_meas_ctx(ham, dense, _cfg(ci_meas.UcisdMeasCfg))
+    expected_fb = jax.vmap(ci_meas.force_bias_kernel_rw_rh, in_axes=(0, None, None, None))(
+        walkers, ham, dctx, dense
+    )
+    # Layout padding contains zero Cholesky vectors.
+    restored_fb = np.zeros(force_bias.shape, dtype=np.complex128)
+    for packed, original in enumerate(layout.permutation):
+        if original >= 0:
+            restored_fb[:, packed] = np.asarray(expected_fb)[:, original]
+    _assert(force_bias, restored_fb)
 
 
 @pytest.fixture(scope="module")

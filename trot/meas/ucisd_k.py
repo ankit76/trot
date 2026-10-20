@@ -20,7 +20,6 @@ from .ucisd import build_meas_ctx as build_dense_meas_ctx
 from .ucisd_modes import (
     _chol_contract,
     _energy_gl_batched_realimag,
-    _spin_sum_chol_contract,
 )
 
 _UCISD_K_MEAS_CFG_ATTR = "_ucisd_k_meas_cfg"
@@ -85,6 +84,8 @@ def build_meas_ctx(
 def _greens_restricted(
     walker: jax.Array,
     trial_data: UcisdKTrial,
+    *,
+    compact_rows: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Build alpha/beta Green functions from one shared restricted walker."""
     noa, nob = trial_data.nocc
@@ -94,8 +95,10 @@ def _greens_restricted(
     green_b = jnp.linalg.solve(wb[:nob].T, wb.T)
     green_occ_a = green_a[:, noa : noa + trial_data.nvir[0]]
     green_occ_b = green_b[:, nob : nob + trial_data.nvir[1]]
-    greenp_a = _greenp_from_active(green_occ_a, trial_data.norb)
-    greenp_b = _greenp_from_active(green_occ_b, trial_data.norb)
+    nrows_a = noa + trial_data.nvir[0] if compact_rows else trial_data.norb
+    nrows_b = nob + trial_data.nvir[1] if compact_rows else trial_data.norb
+    greenp_a = _greenp_from_active(green_occ_a, nrows_a)
+    greenp_b = _greenp_from_active(green_occ_b, nrows_b)
     return green_a, green_b, greenp_a, greenp_b
 
 
@@ -252,7 +255,9 @@ def _force_bias_kernel_rw_rh_with_apply(
 ) -> jax.Array:
     """Combined-K UCISD force bias with a selectable kernel backend."""
     base = meas_ctx.base
-    green_a, green_b, greenp_a, greenp_b = _greens_restricted(walker, trial_data)
+    green_a, green_b, greenp_a, greenp_b = _greens_restricted(
+        walker, trial_data, compact_rows=True
+    )
     noa, nob = trial_data.nocc
     green_occ_a = green_a[:, noa : noa + trial_data.nvir[0]]
     green_occ_b = green_b[:, nob : nob + trial_data.nvir[1]]
@@ -272,11 +277,14 @@ def _force_bias_kernel_rw_rh_with_apply(
     m2_b = (greenp_b @ yb.T) @ green_b
     overlap = 1.0 + singles + doubles
 
-    correction = _spin_sum_chol_contract(
-        ham_data.chol,
+    # Corrections have zero rows outside each spin's occupied + FNO space.
+    # Contract in the native bases using the beta Hamiltonian already in the
+    # context, avoiding both square corrections and a per-walker beta rotation.
+    correction = _separate_spin_chol_contract(
+        ham_data.chol[:, : greenp_a.shape[0], :],
+        base.chol_b[:, : greenp_b.shape[0], :],
         m1_a + m2_a,
         m1_b + m2_b,
-        trial_data.mo_coeff_b,
         base.cfg,
     )
     return (lg * overlap - correction) / overlap
