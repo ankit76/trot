@@ -51,11 +51,14 @@ def _greens_restricted(walker: jax.Array, nocc: int) -> jax.Array:
 def _active_green_blocks(
     green: jax.Array,
     trial_data: CisdModeTrial,
+    *,
+    compact_rows: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     green_act = green[trial_data.occ_act_slice, :]
     green_occ = green[trial_data.occ_act_slice, trial_data.vir_act_slice]
 
-    greenp = jnp.zeros((trial_data.norb, trial_data.nvir), dtype=green.dtype)
+    nrows = trial_data.vir_act_slice.stop if compact_rows else trial_data.norb
+    greenp = jnp.zeros((nrows, trial_data.nvir), dtype=green.dtype)
     greenp = greenp.at[: trial_data.nocc_full, :].set(green[:, trial_data.vir_act_slice])
     greenp = greenp.at[trial_data.vir_act_slice, :].set(
         -jnp.eye(trial_data.nvir, dtype=green.dtype)
@@ -469,7 +472,9 @@ def force_bias_kernel_rw_rh(
     trial_data: CisdModeTrial,
 ) -> jax.Array:
     green = _greens_restricted(walker, trial_data.nocc_full)
-    green_act, green_occ, greenp = _active_green_blocks(green, trial_data)
+    green_act, green_occ, greenp = _active_green_blocks(
+        green, trial_data, compact_rows=True
+    )
 
     lg = jnp.einsum("gpj,pj->g", meas_ctx.rot_chol, green, optimize="optimal")
     ci1g = jnp.einsum("pt,pt->", trial_data.ci1, green_occ, optimize="optimal")
@@ -482,7 +487,8 @@ def force_bias_kernel_rw_rh(
 
     cisd_green = -2.0 * (greenp @ kg.T) @ green_act
     correction = _force_bias_chol_contract_high_realimag(
-        ham_data.chol,
+        # The correction has no rows in the excluded virtual space.
+        ham_data.chol[:, : greenp.shape[0], :],
         cisd_green - 2.0 * gci1gp,
         meas_ctx.cfg,
     )

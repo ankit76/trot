@@ -286,11 +286,16 @@ class PtccsdThoulessModeEnergyCommon(NamedTuple):
     The two base components contain only one-body contributions. The
     determinant-reference two-body energy and connected T2 correction are both
     represented by Cholesky-resolved component terms.
+
+    Let B = [C.conj(), S_v], where S_v selects the retained virtual orbitals.
+    The virtual complement is B @ greenp_coeff and the doubles correction is
+    B @ t2_left_coeff @ half_green. Both coefficient arrays have only
+    nocc + nvir_fno rows, even for a reference with nonzero outer rows.
     """
 
     half_green: jax.Array
-    greenp: jax.Array
-    t2_green: jax.Array
+    greenp_coeff: jax.Array
+    t2_left_coeff: jax.Array
     theta: jax.Array
     electronic_0_base: jax.Array
     h_t_base: jax.Array
@@ -456,10 +461,11 @@ def _thouless_half_green_force_bias_blocks(
 
     half_green = half_green_thouless_r(walker, trial_data)
     nocc = trial_data.nocc
+    stop = nocc + trial_data.nvir
     green_rows = trial_data.mo_t.conj()[:nocc, :] @ half_green
-    green_occ = green_rows[:, nocc:]
-    greenp = trial_data.mo_t.conj() @ half_green[:, nocc:]
-    greenp = greenp.at[nocc:, :].add(
+    green_occ = green_rows[:, nocc:stop]
+    greenp = trial_data.mo_t.conj() @ half_green[:, nocc:stop]
+    greenp = greenp.at[nocc:stop, :].add(
         -jnp.eye(trial_data.nvir, dtype=greenp.dtype)
     )
     return half_green, green_rows, green_occ, greenp
@@ -511,11 +517,22 @@ def _mode_t2_green_factors(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return the left factor, full correction, and scalar T2 contraction."""
 
+    t2_left, theta2 = _mode_t2_left(trial_data, green_occ, greenp)
+    t2_green = t2_left @ green_rows
+    return t2_left, t2_green, theta2
+
+
+def _mode_t2_left(
+    trial_data,
+    green_occ: jax.Array,
+    greenp: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Form the occupied-rank doubles factor without its full matrix product."""
+
     projections, kg = mode_apply(trial_data, green_occ)
     theta2 = mode_quadratic(trial_data, green_occ, projections)
     t2_left = greenp @ kg.T
-    t2_green = t2_left @ green_rows
-    return t2_left, t2_green, theta2
+    return t2_left, theta2
 
 
 def force_bias_pt_rw_rh(
@@ -751,27 +768,32 @@ def _ptccsd_thouless_mode_energy_common(
 ) -> PtccsdThoulessModeEnergyCommon:
     """Build per-walker data outside the Cholesky component sum."""
 
-    half_green, green, green_rows, green_occ, greenp = _thouless_half_green_blocks(
-        walker,
-        trial_data,
-    )
+    half_green = half_green_thouless_r(walker, trial_data)
+    nocc = trial_data.nocc
+    vir = slice(nocc, nocc + trial_data.nvir)
     h1 = ham_data.h1
-    hg = jnp.einsum("pq,pq->", h1, green, optimize="optimal")
-    e1_0 = 2.0 * hg
-    _, t2_green, theta2 = _mode_t2_green_factors(
-        trial_data,
-        green_occ,
-        greenp,
-        green_rows=green_rows,
+    reference = trial_data.mo_t.conj()
+    green_occ = reference[:nocc, :] @ half_green[:, vir]
+    # P = C^* H_v - S_v = [C^*, S_v] [H_v; -I]. Work in this small
+    # coefficient space instead of constructing P with norb rows.
+    greenp_coeff = jnp.vstack(
+        [half_green[:, vir], -jnp.eye(trial_data.nvir, dtype=half_green.dtype)]
     )
+    h1_trial = jnp.vstack([reference.T @ h1, h1[vir, :]])
+    hg = jnp.einsum("iq,iq->", h1_trial[:nocc, :], half_green, optimize="optimal")
+    e1_0 = 2.0 * hg
+    t2_left_coeff, theta2 = _mode_t2_left(trial_data, green_occ, greenp_coeff)
+    # G[:nocc] = C[:nocc].conj() @ half_green. Fold the occupied reference
+    # block into the left factor; do not assume that block is the identity.
+    t2_left_coeff = t2_left_coeff @ reference[:nocc, :]
     e1_2 = 2.0 * hg * theta2 - 2.0 * jnp.einsum(
-        "pq,pq->", h1, t2_green, optimize="optimal"
+        "pi,ip->", t2_left_coeff, half_green @ h1_trial.T, optimize="optimal"
     )
 
     return PtccsdThoulessModeEnergyCommon(
         half_green=half_green,
-        greenp=greenp,
-        t2_green=t2_green,
+        greenp_coeff=greenp_coeff,
+        t2_left_coeff=t2_left_coeff,
         theta=theta2,
         electronic_0_base=e1_0,
         h_t_base=e1_2,
@@ -790,8 +812,9 @@ def _ptccsd_thouless_mode_chol_terms(
     reference_occ = trial_data.mo_t.conj()[: trial_data.nocc, :].astype(
         meas_ctx.cfg.mixed_complex_dtype
     )
-    greenp_mixed = common.greenp.astype(meas_ctx.cfg.mixed_complex_dtype)
-    t2_green_mixed = common.t2_green.astype(meas_ctx.cfg.mixed_complex_dtype)
+    greenp_mixed = common.greenp_coeff.astype(meas_ctx.cfg.mixed_complex_dtype)
+    t2_left_mixed = common.t2_left_coeff.astype(meas_ctx.cfg.mixed_complex_dtype)
+    vir = slice(trial_data.nocc, trial_data.nocc + trial_data.nvir)
 
     def scalar_term(chol_i: jax.Array, rot_chol_i: jax.Array) -> jax.Array:
         lg_i = jnp.einsum(
@@ -808,20 +831,24 @@ def _ptccsd_thouless_mode_chol_terms(
         )
         e20_i = 2.0 * lg_i * lg_i
         e20_i -= jnp.sum(lg1_i * jnp.swapaxes(lg1_i, -1, -2))
-        lt2g_i = _chol_contract(
-            chol_i[None, ...], common.t2_green, meas_ctx.cfg
-        )[0]
-        gl_half_i = _energy_gl_scalar(common.half_green, chol_i, meas_ctx.cfg)
-        lt2_half_i = jnp.einsum(
-            "ir,qr->iq",
-            rot_chol_i.astype(meas_ctx.cfg.mixed_complex_dtype),
-            t2_green_mixed,
+        # H L^T [C^*, S_v] = [lg1^T, H L[v, :]^T]. Reuse the occupied
+        # block and compute only the retained virtual block.
+        gl_trial_i = jnp.concatenate(
+            [
+                lg1_i.T.astype(meas_ctx.cfg.mixed_complex_dtype),
+                _energy_gl_scalar(common.half_green, chol_i[vir, :], meas_ctx.cfg),
+            ],
+            axis=-1,
+        )
+        gl_t2_i = gl_trial_i @ t2_left_mixed
+        lt2g_i = jnp.trace(gl_t2_i)
+        e222_i = 0.5 * jnp.einsum(
+            "ij,ij->",
+            lg1_i.astype(meas_ctx.cfg.mixed_complex_dtype),
+            gl_t2_i,
             optimize="optimal",
         )
-        e222_i = 0.5 * jnp.einsum(
-            "iq,iq->", gl_half_i, lt2_half_i, optimize="optimal"
-        )
-        gl_occ_i = reference_occ @ gl_half_i
+        gl_occ_i = reference_occ @ gl_trial_i
         glgp_i = jnp.einsum(
             "pi,it->pt", gl_occ_i, greenp_mixed, optimize="optimal"
         )
@@ -860,21 +887,25 @@ def _ptccsd_thouless_mode_chol_terms(
         lg1 * jnp.swapaxes(lg1, -1, -2),
         axis=(-1, -2),
     )
-    lt2g = _chol_contract(chol, common.t2_green, meas_ctx.cfg)
-    gl_half = _energy_gl_batched(common.half_green, chol, meas_ctx.cfg)
-    lt2_half = jnp.einsum(
-        "gir,qr->giq",
-        rot_chol.astype(meas_ctx.cfg.mixed_complex_dtype),
-        t2_green_mixed,
-        optimize="optimal",
+    gl_trial = jnp.concatenate(
+        [
+            jnp.swapaxes(lg1, -1, -2).astype(meas_ctx.cfg.mixed_complex_dtype),
+            _energy_gl_batched(common.half_green, chol[:, vir, :], meas_ctx.cfg),
+        ],
+        axis=-1,
     )
+    gl_t2 = jnp.einsum("giq,qj->gij", gl_trial, t2_left_mixed, optimize="optimal")
+    lt2g = jnp.trace(gl_t2, axis1=-2, axis2=-1)
     e222 = 0.5 * jnp.einsum(
-        "giq,giq->g", gl_half, lt2_half, optimize="optimal"
+        "gij,gij->g",
+        lg1.astype(meas_ctx.cfg.mixed_complex_dtype),
+        gl_t2,
+        optimize="optimal",
     )
     gl_occ = jnp.einsum(
         "ji,gip->gjp",
         reference_occ,
-        gl_half,
+        gl_trial,
         optimize="optimal",
     )
     glgp = jnp.einsum(

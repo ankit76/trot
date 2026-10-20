@@ -134,6 +134,37 @@ workspace and disables autotuning only for that setup compilation, avoiding
 profiling copies of the full Cholesky tensor. The output shape, precision,
 model-axis sharding, mode chunks, and production contractions are unchanged.
 
+Restricted CISD-mode force bias builds its density correction with only
+`nocc_full + nvir_fno` rows and contracts it against the matching Cholesky
+slice. Its other orbital axis remains full-sized. Frozen trial occupied
+orbitals are included in the row count; excluded virtual rows are never
+constructed. Mode projections retain the compact FNO pair dimension.
+
+Restricted PT-CCSD Thouless-mode energy kernels represent the virtual
+complement and doubles correction in the span of the reference orbitals and
+retained virtual unit vectors. With $H$ the half Green function, $C$ the
+Thouless reference, and $S_v$ the retained virtual selector, define
+$$
+B=[C^*,S_v],\qquad P=B\begin{pmatrix}H_v\\-I\end{pmatrix}.
+$$
+`greenp_coeff` and `t2_left_coeff` have shapes
+`(nocc + nvir_fno, nvir_fno)` and `(nocc + nvir_fno, nocc)`, respectively.
+The physical doubles correction is `B @ t2_left_coeff @ half_green`;
+neither `B` nor that full orbital-square product is constructed. This remains
+valid for complex occupied gauges and reference orbitals with nonzero
+components outside the FNO space.
+
+The Cholesky loop already computes $R_\gamma=(C^{*T}L_\gamma)H^T$ for the
+reference energy. It reuses this via
+$$
+H L_\gamma^T B=[R_\gamma^T,\;H L_\gamma[v,:]^T].
+$$
+Only the retained virtual output columns need a new Green--Cholesky product.
+Deterministic energy, calibration, and global/local pair sampling share this
+kernel. The Hamiltonian and walkers retain their full orbital space. These
+changes alter contraction order and storage, with no new truncation; precision
+settings and the exponential-guide force-bias algorithm are unchanged.
+
 The mixed-estimator driver reuses the guide's full beta-basis Cholesky tensor
 when building a dense or mode PT2-UCCSD estimator with exactly the same beta
 orbital matrix. This removes one full tensor allocation without changing the
@@ -521,6 +552,28 @@ also retain `nvir_t_outer=(discarded_alpha, discarded_beta)`; legacy mode data
 defaults to `(0, 0)`. UCISD mode caches infer the retained dimensions from the
 stored singles arrays. FNO selection is independent of eigenmode compression;
 neither precision defaults nor sampling policies are changed by using FNO.
+
+Restricted PT-CCSD Thouless modes likewise support compact FNO virtuals:
+
+```python
+trial = make_ptccsd_thouless_mode_trial_data({
+    "t1": t1_fno,
+    "eigenvalues": eigenvalues,
+    "modes": modes_fno,             # (rank, nocc, nvir_fno)
+    "nvir_t_outer": norb - nocc - nvir_fno,
+})
+```
+
+The small Thouless reference gets full orbital rows; the doubles modes do not
+get zero-padded. The energy kernel represents the virtual complement with
+`(nocc + nvir_fno, nvir_fno)` coefficients, while the Hamiltonian and walkers
+remain full-space. Supplying a full `mo_t` or full-width `t1` instead lets the
+loader infer the outer count from the mode dimensions.
+Legacy padded inputs remain valid. To obtain compact storage from an existing
+zero-padded archive, slice `modes[:, :, :nvir_fno]` using the known retained FNO
+count and retain the full `t1`; the loader then infers the excluded virtuals.
+No new CC calculation or mode decomposition is needed. This support is in
+`PtccsdThoulessModeTrial`, the restricted projected-estimator mode path.
 
 #### Retained-mode CISD/UCISD trials
 

@@ -200,7 +200,7 @@ def test_complex_joint_strata_with_one_pair_each_and_no_diagnostic():
     np.testing.assert_array_equal(noise, 0)
 
 
-def prepare(kind, mixed, n_model, head_size, *, abstract=False, memory_mode="high", n_data=1):
+def prepare(kind, mixed, n_model, head_size, *, memory_mode="high", n_data=1):
     mesh = model_mesh(n_model, n_data)
     module = rm if kind == "rcc" else um
     h, t, w, weights = host_inputs(kind, mixed)
@@ -219,7 +219,9 @@ def prepare(kind, mixed, n_model, head_size, *, abstract=False, memory_mode="hig
     build = rm.build_ptccsd_thouless_mode_meas_ctx if kind == "rcc" else um.build_ptuccsd_mode_meas_ctx
     context_fn = lambda h, t: build(h, t, cfg=cfg, n_mode_chunks=3,
                                   **({"memory_mode": memory_mode} if kind == "rcc" else {}))
-    ctx = jax.eval_shape(context_fn, h, t) if abstract else context_fn(h, t)
+    # Setup has top-level-only compiler options. Build these tiny contexts
+    # before abstract-tracing the production kernel below.
+    ctx = context_fn(h, t)
     sampling_cls = rm.PtccsdModePairSamplingCfg if kind == "rcc" else um.PtuccsdModePairSamplingCfg
     ctx = replace(ctx, component_sampling=sampling_cls(head_size, 17, head_chol_batch_size=2,
         walker_guide_policy="head_rms", track_half_sample_diagnostic=True))
@@ -239,7 +241,7 @@ def functions(kind):
 @pytest.mark.parametrize("memory_mode", ["high", "low"])
 def test_abstract_pt_local_trace_and_frozen_guards(kind, mixed, n_data, n_model, memory_mode):
     module, mesh, layout, h, ctx, t, w, weights = prepare(
-        kind, mixed, n_model, 3, abstract=True, memory_mode=memory_mode, n_data=n_data)
+        kind, mixed, n_model, 3, memory_mode=memory_mode, n_data=n_data)
     _, block = functions(kind)
     for chunks in (1, 5):
         result = jax.eval_shape(lambda w, wt, key, h, c, t: block(w, wt, key, chunks, h, c, t),

@@ -125,22 +125,32 @@ class PtccsdModeTrial:
 @tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class PtccsdThoulessModeTrial:
-    """Restricted Thouless reference plus a spectral representation of raw ``T2``."""
+    """Restricted Thouless reference plus compact raw-``T2`` modes.
+
+    ``nvir_t_outer`` counts trailing virtuals excluded from the doubles trial.
+    The reference, Hamiltonian, and walkers still use the full orbital space.
+    """
 
     mo_t: jax.Array
     eigenvalues: jax.Array
     modes: jax.Array
+    nvir_t_outer: int = 0
 
     def __post_init__(self) -> None:
         if not hasattr(self.mo_t, "ndim") or not hasattr(self.modes, "ndim"):
             return
         if self.mo_t.ndim != 2:
             raise ValueError(f"mo_t must have rank 2, got shape {self.mo_t.shape}.")
+        if self.modes.ndim != 3:
+            raise ValueError(f"modes must have rank 3, got shape {self.modes.shape}.")
+        if self.nvir_t_outer < 0:
+            raise ValueError("nvir_t_outer must be nonnegative.")
         nocc = int(self.mo_t.shape[1])
         nvir = int(self.modes.shape[2])
-        if self.mo_t.shape[0] != nocc + nvir:
+        norb = nocc + nvir + self.nvir_t_outer
+        if self.mo_t.shape[0] != norb:
             raise ValueError(
-                f"mo_t must have shape {(nocc + nvir, nocc)}, got {self.mo_t.shape}."
+                f"mo_t must have shape {(norb, nocc)}, got {self.mo_t.shape}."
             )
         _validate_modes(self.eigenvalues, self.modes, nocc=nocc, nvir=nvir)
 
@@ -154,20 +164,19 @@ class PtccsdThoulessModeTrial:
 
     @property
     def norb(self) -> int:
-        return self.nocc + self.nvir
+        return int(self.mo_t.shape[0])
 
     @property
     def mode_rank(self) -> int:
         return int(self.eigenvalues.shape[0])
 
     def tree_flatten(self):
-        return (self.mo_t, self.eigenvalues, self.modes), None
+        return (self.mo_t, self.eigenvalues, self.modes), self.nvir_t_outer
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        del aux
         mo_t, eigenvalues, modes = children
-        return cls(mo_t=mo_t, eigenvalues=eigenvalues, modes=modes)
+        return cls(mo_t=mo_t, eigenvalues=eigenvalues, modes=modes, nvir_t_outer=aux)
 
 
 def make_ptccsd_mode_trial_data(
@@ -205,11 +214,14 @@ def make_ptccsd_thouless_mode_trial_data(
     discarded_norm_target: float | None = None,
     minimum_rank: int = 0,
 ) -> PtccsdThoulessModeTrial:
-    if "mo_t" in data:
-        mo_t = jnp.asarray(data["mo_t"])
-    else:
-        t1 = jnp.asarray(data["t1"])
-        mo_t = jnp.vstack([jnp.eye(t1.shape[0], dtype=t1.dtype), t1.T])
+    """Build a restricted PT trial without padding its FNO doubles modes.
+
+    Supply compact ``t1`` and ``t2``/``modes`` with ``nvir_t_outer`` to retain
+    the full Hamiltonian space. Alternatively, a full ``mo_t`` or full-width
+    ``t1`` determines the outer count from the compact mode dimensions.
+    Existing full-space inputs retain ``nvir_t_outer=0``.
+    """
+
     if "eigenvalues" in data and "modes" in data:
         eigenvalues = np.asarray(data["eigenvalues"], dtype=np.float64)
         modes = np.asarray(data["modes"])
@@ -220,11 +232,30 @@ def make_ptccsd_thouless_mode_trial_data(
             discarded_norm_target=discarded_norm_target,
             minimum_rank=minimum_rank,
         )
+    if modes.ndim != 3:
+        raise ValueError(f"modes must have rank 3, got shape {modes.shape}.")
+    _, nocc, nvir = modes.shape
+    if "mo_t" in data:
+        mo_t = jnp.asarray(data["mo_t"])
+        nvir_t_outer = int(data.get("nvir_t_outer", mo_t.shape[0] - nocc - nvir))
+    else:
+        t1 = jnp.asarray(data["t1"])
+        if t1.ndim != 2 or t1.shape[0] != nocc:
+            raise ValueError(f"t1 must have {nocc} occupied rows, got shape {t1.shape}.")
+        nvir_t_outer = int(data.get("nvir_t_outer", t1.shape[1] - nvir))
+        if nvir_t_outer < 0:
+            raise ValueError("nvir_t_outer must be nonnegative.")
+        if t1.shape[1] == nvir:
+            t1 = jnp.pad(t1, ((0, 0), (0, nvir_t_outer)))
+        elif t1.shape[1] != nvir + nvir_t_outer:
+            raise ValueError("t1 must span either the retained or full virtual space.")
+        mo_t = jnp.vstack([jnp.eye(nocc, dtype=t1.dtype), t1.T])
     mode_dtype = jnp.float32 if mixed_precision else jnp.float64
     return PtccsdThoulessModeTrial(
         mo_t=mo_t,
         eigenvalues=jnp.asarray(eigenvalues, dtype=jnp.float64),
         modes=jnp.asarray(modes, dtype=mode_dtype),
+        nvir_t_outer=nvir_t_outer,
     )
 
 
@@ -277,7 +308,10 @@ def _det_overlap_and_green_occ_thouless_r(
     overlap_mat = trial_data.mo_t.conj().T @ walker
     half_green = jnp.linalg.solve(overlap_mat.T, walker.T)
     nocc = trial_data.nocc
-    green_occ = trial_data.mo_t.conj()[:nocc, :] @ half_green[:, nocc:]
+    green_occ = (
+        trial_data.mo_t.conj()[:nocc, :]
+        @ half_green[:, nocc : nocc + trial_data.nvir]
+    )
     return jnp.linalg.det(overlap_mat) ** 2, green_occ
 
 
@@ -292,7 +326,9 @@ def greenp_thouless(
     green: jax.Array,
     trial_data: PtccsdThoulessModeTrial,
 ) -> jax.Array:
-    return (green - jnp.eye(trial_data.norb, dtype=green.dtype))[:, trial_data.nocc :]
+    start = trial_data.nocc
+    stop = start + trial_data.nvir
+    return (green - jnp.eye(trial_data.norb, dtype=green.dtype))[:, start:stop]
 
 
 def det_overlap_thouless_r(

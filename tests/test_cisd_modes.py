@@ -495,7 +495,10 @@ def test_batched_singles_preserves_dtype_and_bilinear_contraction(dtype):
 def test_full_rank_double_mode_force_bias_and_energy_match_dense(
     nocc_t_core,
     nvir_t_outer,
+    monkeypatch,
 ):
+    from trot.meas import cisd_modes as meas
+
     dense_trial, mode_trial, _, _ = _make_dense_and_mode_trials(
         nocc=2,
         nvir=3,
@@ -530,7 +533,19 @@ def test_full_rank_double_mode_force_bias_and_energy_match_dense(
     )
 
     dense_fb = dense_force_bias_kernel(walker, ham, dense_ctx, dense_trial)
-    mode_fb = jax.jit(mode_force_bias_kernel)(walker, ham, mode_ctx, mode_trial)
+    contract = meas._force_bias_chol_contract_high_realimag
+
+    def compact_contract(chol, correction, cfg):
+        # Resource regression: the FNO guide must not form an orbital-square
+        # correction when excluded virtuals are present.
+        nrows = mode_trial.nocc_full + mode_trial.nvir
+        assert correction.shape == (nrows, mode_trial.norb)
+        assert chol.shape == (ham.chol.shape[0], nrows, mode_trial.norb)
+        return contract(chol, correction, cfg)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(meas, "_force_bias_chol_contract_high_realimag", compact_contract)
+        mode_fb = jax.jit(mode_force_bias_kernel)(walker, ham, mode_ctx, mode_trial)
     dense_energy = dense_energy_kernel(walker, ham, dense_ctx, dense_trial)
     mode_energy = jax.jit(mode_energy_kernel)(walker, ham, mode_ctx, mode_trial)
 
