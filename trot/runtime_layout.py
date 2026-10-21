@@ -51,7 +51,10 @@ class QmcRuntime:
 
     Pass this object instead of separate Hamiltonian/context arguments when
     the driver should redistribute Choleskies. Keep this owner, rather than
-    separate references to its old arrays, to allow those buffers to be freed.
+    separate references to its old arrays: redistribution explicitly deletes
+    obsolete device arrays as their replacements become ready. On failure,
+    usable inputs in the original ordering are restored through this owner;
+    old array objects may already have been consumed.
     ``on_update`` lets a Job keep its cached inputs consistent with the owner.
     """
 
@@ -72,6 +75,8 @@ class QmcRuntime:
     def inputs(self, *, ham_data, prop_ctx, contexts, retune=False, local_sampling=True):
         if ham_data is not None or prop_ctx is not None or any(c is not None for c in contexts):
             raise ValueError("Pass runtime or separate Hamiltonian/context inputs, not both.")
+        if self.ham_data is None:
+            raise RuntimeError("Runtime inputs are unavailable; rebuild the runtime before reuse.")
         owned_contexts = (self.meas_ctx,)
         if len(contexts) == 2:
             owned_contexts += (self.estimator_ctx,)

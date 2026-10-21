@@ -679,9 +679,17 @@ This option does not enable Hamiltonian sharding or pair sampling; deterministic
 calculations, single-GPU runs, and walker-only sharded runs keep their existing
 paths. For low-level PT runs, `state, runtime = job.prepare_runtime()` supplies
 an owned `QmcRuntime` to `run_mixed_estimator_qmc(runtime=runtime, ...)`.
-This lets the driver update the Job caches and release the original arrays
-after redistribution. Separate borrowed Hamiltonian/context arguments retain
-the global sampler. See [Cholesky pair sampling](cholesky_pair_sampling.md) for
+This lets the driver update the Job caches and release each original device
+array as its replacement becomes ready, instead of keeping both complete
+layouts resident. Shared guide/estimator arrays are reordered once; flattened
+views and separate propagation buffers are also retired, with shared device
+buffers kept until all runtime aliases have replacements. This changes only
+the one-time transition, not production kernels or sampling settings. It still
+needs space for the current tensor's replacement. On allocation failure, the
+runtime owner is restored in the original ordering using temporary CPU copies;
+callers must use that owner, not references to consumed arrays. If restoration
+also fails, the runtime must be rebuilt. Separate borrowed Hamiltonian/context
+arguments retain the global sampler. See [Cholesky pair sampling](cholesky_pair_sampling.md) for
 eligibility, temporary memory requirements, and low-level installation.
 
 ### 2. `setup()` function (mid-level)

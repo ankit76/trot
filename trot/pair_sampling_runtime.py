@@ -1,6 +1,9 @@
 """Host-side installation of frozen local-Cholesky population estimators."""
 from dataclasses import replace
 
+import jax
+import numpy as np
+
 from .ham.chol import HamChol
 from .meas.cisd import CisdMeasCtx
 from .meas.cisd_modes import CisdModeMeasCtx
@@ -26,6 +29,78 @@ _GUIDE_CONTEXTS = (CisdMeasCtx, UcisdMeasCtx, UcisdModeMeasCtx, RhfMeasCtx, UhfM
 
 def _sampling(ctx):
     return getattr(ctx, "component_sampling", getattr(ctx, "energy_sampling", None))
+
+
+class _CholeskyReorder:
+    """Replace owned arrays progressively; keep borrowed inputs immutable.
+
+    Distinct JAX objects can share device buffers (including flattened views).
+    Delete a buffer only after every runtime alias has a ready replacement.
+    Host copies are needed only to restore the owner after a failed transition.
+    """
+
+    def __init__(self, inputs, mesh, layout, runtime):
+        self.inputs, self.mesh, self.layout, self.runtime = inputs, mesh, layout, runtime
+        self.reordered = {}
+        self.created = {}
+        self.arrays = {}
+        self.buffers = {}
+        self.owners = {}
+        if runtime is not None:
+            self.arrays = {id(a): a for a in jax.tree.leaves(inputs) if isinstance(a, jax.Array)}
+            for key, array in self.arrays.items():
+                buffers = {(s.device, s.data.unsafe_buffer_pointer())
+                           for s in array.addressable_shards if s.data.size}
+                self.buffers[key] = buffers
+                for buffer in buffers:
+                    self.owners.setdefault(buffer, set()).add(key)
+
+    def __call__(self, array):
+        key = id(array)
+        if key not in self.reordered:
+            self.adopt(array, redistribute_cholesky(array, self.mesh, self.layout))
+        result = self.reordered[key]
+        shape = (self.layout.permutation.size, *array.shape[1:])
+        return result if result.shape == shape else result.reshape(shape)
+
+    def adopt(self, old, new):
+        new.block_until_ready()
+        self.created[id(new)] = new
+        self.reordered.setdefault(id(old), new)
+        if self.runtime is not None:
+            for key in self.reordered:
+                array = self.arrays.get(key)
+                if array is not None and not array.is_deleted() and all(
+                        self.owners[b] <= self.reordered.keys() for b in self.buffers[key]):
+                    array.delete()
+        return new
+
+    def restore(self):
+        """Restore original ordering on failure, using CPU RAM only on this path.
+
+        Old JAX objects remain consumed; the runtime (and Job update hook)
+        receive usable replacements. Free partial outputs before restoring
+        device storage, so rollback does not recreate the old/new memory peak.
+        """
+        if self.runtime is None:
+            return
+        try:
+            host = {}
+            for key, array in self.arrays.items():
+                if array.is_deleted():
+                    new = np.asarray(self.reordered[key]).reshape(
+                        self.layout.permutation.size, *array.shape[1:])
+                    host[key] = new[self.layout.inverse_permutation]
+            for array in self.created.values():
+                array.delete()
+            restored = {key: jax.device_put(value, self.arrays[key].sharding).block_until_ready()
+                        for key, value in host.items()}
+            self.runtime.update(*jax.tree.map(lambda a: restored.get(id(a), a), self.inputs))
+        except Exception as exc:
+            # Never expose an owner containing a mixture of deleted/reordered
+            # inputs if even restoration fails (for example, device loss).
+            self.runtime.update(None, None, (None,) * len(self.inputs[2]))
+            raise RuntimeError("Could not restore the Cholesky runtime; rebuild it before reuse.") from exc
 
 
 def _reorder_context(ctx, reorder):
@@ -56,46 +131,46 @@ def _reorder_context(ctx, reorder):
                              ("rot_chol_flat_a", "rot_chol_a"), ("rot_chol_flat_b", "rot_chol_b")):
             if hasattr(changed, flat):
                 array = getattr(changed, tensor)
-                changed = replace(changed, **{flat: array.reshape(array.shape[0], -1)})
+                value = reorder.adopt(getattr(ctx, flat), array.reshape(array.shape[0], -1))
+                changed = replace(changed, **{flat: value})
     if hasattr(changed, "reference_chol_scores") and changed.reference_chol_scores.size:
         changed = replace(changed, reference_chol_scores=reorder(changed.reference_chol_scores))
     return changed
 
 
-def _install_local_cholesky_sampling(ham_data, prop_ctx, contexts, mesh, eligible):
+def _install_local_cholesky_sampling(ham_data, prop_ctx, contexts, mesh, eligible, *, runtime=None):
     # In a mixed run the estimator is last. Prioritize the PT proposal; retain
     # the guide's own head/probabilities on that same physical permutation.
     primary = contexts[eligible[-1]]
     layout = plan_cholesky_layout(ham_data.chol.shape[0], mesh.shape["model"],
         primary.chol_head_indices, primary.chol_tail_indices, primary.chol_tail_prob)
-    reordered = {}
-
-    def reorder(array):
-        # Guide and estimator contexts can share the same arrays.
-        if id(array) not in reordered:
-            reordered[id(array)] = redistribute_cholesky(array, mesh, layout)
-        return reordered[id(array)]
-    ham_new = replace(ham_data, chol=reorder(ham_data.chol), nchol=None)
-    # Eager JAX reshape can copy. Retain the same tensor when dtypes match and
-    # flatten inside the compiled VHS contraction; keep mixed/packed storage.
-    share_chol = not prop_ctx.chol_packed and prop_ctx.chol_flat.dtype == ham_new.chol.dtype
-    chol_vhs = ham_new.chol if share_chol else _prepare_chol_for_vhs(
-        ham_new.chol, dtype=prop_ctx.chol_flat.dtype, packed_cholesky=prop_ctx.chol_packed)
-    prop_new = replace(prop_ctx, chol_flat=chol_vhs,
-        mf_shifts=reorder(prop_ctx.mf_shifts))
-    new_contexts = []
-    for i, ctx in enumerate(contexts):
-        changed = _reorder_context(ctx, reorder)
-        if isinstance(ctx, _SAMPLED_CONTEXTS) and _sampling(ctx) is not None:
-            own_layout = remap_cholesky_layout(layout, ctx.chol_head_indices,
-                                               ctx.chol_tail_indices, ctx.chol_tail_prob)
-            if i in eligible:
-                changed = with_local_cholesky_sampling(changed, own_layout, mesh)
-            else:
-                changed = replace(changed, chol_head_indices=replicate(own_layout.head_indices, mesh),
-                    chol_tail_indices=replicate(own_layout.tail_indices, mesh),
-                    chol_tail_prob=replicate(own_layout.tail_prob, mesh))
-        new_contexts.append(changed)
+    reorder = _CholeskyReorder((ham_data, prop_ctx, contexts), mesh, layout, runtime)
+    try:
+        ham_new = replace(ham_data, chol=reorder(ham_data.chol), nchol=None)
+        # Eager JAX reshape can copy. Retain the same tensor when dtypes match and
+        # flatten inside the compiled VHS contraction; keep mixed/packed storage.
+        share_chol = not prop_ctx.chol_packed and prop_ctx.chol_flat.dtype == ham_new.chol.dtype
+        chol_vhs = ham_new.chol if share_chol else _prepare_chol_for_vhs(
+            ham_new.chol, dtype=prop_ctx.chol_flat.dtype, packed_cholesky=prop_ctx.chol_packed)
+        reorder.adopt(prop_ctx.chol_flat, chol_vhs)
+        prop_new = replace(prop_ctx, chol_flat=chol_vhs,
+            mf_shifts=reorder(prop_ctx.mf_shifts))
+        new_contexts = []
+        for i, ctx in enumerate(contexts):
+            changed = _reorder_context(ctx, reorder)
+            if isinstance(ctx, _SAMPLED_CONTEXTS) and _sampling(ctx) is not None:
+                own_layout = remap_cholesky_layout(layout, ctx.chol_head_indices,
+                                                   ctx.chol_tail_indices, ctx.chol_tail_prob)
+                if i in eligible:
+                    changed = with_local_cholesky_sampling(changed, own_layout, mesh)
+                else:
+                    changed = replace(changed, chol_head_indices=replicate(own_layout.head_indices, mesh),
+                        chol_tail_indices=replicate(own_layout.tail_indices, mesh),
+                        chol_tail_prob=replicate(own_layout.tail_prob, mesh))
+            new_contexts.append(changed)
+    except Exception:
+        reorder.restore()
+        raise
     print(f"[sampling] local Cholesky sampling on {layout.n_model} model shards "
           f"and {mesh.shape.get('data', 1)} data shards; "
           f"balanced layout from {type(primary).__name__}; "
@@ -104,16 +179,20 @@ def _install_local_cholesky_sampling(ham_data, prop_ctx, contexts, mesh, eligibl
 
 
 def prepare_local_cholesky_sampling(ham_data, prop_ctx, contexts, *, enabled=True, runtime=None):
-    """Update an owned runtime, allowing obsolete device buffers to be freed."""
+    """Consume an owned runtime's old Cholesky arrays as replacements are ready.
+
+    After success or an allocation failure, use the owner rather than separate
+    references to its previous arrays. Borrowed runtime inputs are not consumed.
+    """
     result = _prepare_local_cholesky_sampling(
-        ham_data, prop_ctx, contexts, enabled=enabled, owned=runtime is not None,
+        ham_data, prop_ctx, contexts, enabled=enabled, runtime=runtime,
     )
     if runtime is not None:
         runtime.update(*result)
     return result
 
 
-def _prepare_local_cholesky_sampling(ham_data, prop_ctx, contexts, *, enabled, owned):
+def _prepare_local_cholesky_sampling(ham_data, prop_ctx, contexts, *, enabled, runtime):
     """Install local sampling only for supported, frozen, model-sharded runs.
 
     Drivers call this before the first block for fixed policies, or after
@@ -146,7 +225,7 @@ def _prepare_local_cholesky_sampling(ham_data, prop_ctx, contexts, *, enabled, o
         eligible.append(i)
     if not eligible:
         return unchanged
-    if not owned:
+    if runtime is None:
         print("[sampling] retaining global sampling for borrowed runtime inputs; "
               "pass QmcRuntime to enable redistribution without retaining old arrays.", flush=True)
         return unchanged
@@ -154,4 +233,4 @@ def _prepare_local_cholesky_sampling(ham_data, prop_ctx, contexts, *, enabled, o
             ctx is not None and not isinstance(ctx, _SAMPLED_CONTEXTS + _GUIDE_CONTEXTS) for ctx in contexts):
         print("[sampling] custom runtime context has no Cholesky layout adapter; retaining global sampling.", flush=True)
         return unchanged
-    return _install_local_cholesky_sampling(ham_data, prop_ctx, contexts, mesh, eligible)
+    return _install_local_cholesky_sampling(ham_data, prop_ctx, contexts, mesh, eligible, runtime=runtime)
