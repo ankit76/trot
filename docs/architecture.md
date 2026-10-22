@@ -319,6 +319,47 @@ selects the appropriate `trial_ops` / `meas_ops` /
 **QMC execution** (`driver.py`) runs the equilibration and sampling loops,
 calling the JIT compiled `block` function with `jax.lax.scan`.
 
+The phaseless drivers (`run_qmc`, `run_mixed_estimator_qmc`, and legacy
+`run_mixed_qmc`) support opt-in saving of cumulative **raw production-block
+samples after every progress report**, including the last partial reporting
+interval. Saving is disabled by default (`sample_dir=None`), so ordinary calls
+do not create sample files in the working directory. Set the driver keyword
+`sample_dir=OUTPUT / "samples"` to enable saving in a chosen output directory;
+`job.kernel` and the high-level `Afqmc.kernel` forward this keyword.
+`run_qmc_energy` also accepts it. When enabled, each invocation creates a
+unique `samples_<driver>_seed<seed>_<id>.npz` in that directory and prints its
+path. Repeats with the same seed use separate files.
+
+Each snapshot replaces the previous one atomically, after flushing the new
+archive to disk. An interrupted write leaves the previous snapshot readable;
+an I/O error stops the run instead of silently continuing without saved data.
+This does not depend on receiving a scheduler termination signal. A timeout
+between reports loses at most the in-progress reporting interval (the current
+cadence is `max(1, n_blocks // 10)` production blocks). Equilibration and
+post-tuning settling are excluded. These files are analysis samples, **not
+walker restart checkpoints**. Free-projection drivers are unchanged.
+
+Archives load with `np.load(path, allow_pickle=False)` and include the seed,
+system dimensions, timestep, block length, walker count, requested/completed
+production counts, and `sampling_complete`. The arrays are never filtered:
+
+- Standard AFQMC: `energies`, `weights`, optional `observable_<name>` arrays,
+  and `diagnostic_<name>` arrays. Offline cleanup can use `reject_outliers`.
+- Component estimators (including PT-CCSD/PT-UCCSD): `components`,
+  `component_names`, `weights`, `h0`, `guide_energies`, `guide_weights`,
+  `proxy_energies`, `keep_mask`, and `diagnostic_<name>` arrays. Complex values
+  and rejected/nonfinite samples are preserved. `estimator_outlier_zeta` is
+  the reporting threshold (`NaN` when robust cleanup is disabled), and
+  `guide_energy_label` distinguishes guide energy from population-control
+  shift energy. The saved mask belongs to that snapshot and may change as
+  more blocks arrive. Recompute it with `component_estimator_outlier_mask`
+  when choosing a different cleanup threshold; combine **weighted component
+  means** using the same estimator's `combine_energy`, rather than averaging
+  the per-block proxy energies.
+- Legacy PT2-CCSD: raw `weights`, `t2`, `e0`, `e1`, `guide_energies`, and
+  `guide_weights`; these can be passed through the existing cleanup and
+  `pt2ccsd_blocking` analysis.
+
 The runtime and direct drivers pass the already built measurement context
 to `PropOps.init_prop_state` through its optional `meas_ctx` keyword. State
 initialization reuses this context for the initial energy instead of building

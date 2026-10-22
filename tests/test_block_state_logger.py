@@ -4,6 +4,7 @@ config.configure_once()
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from trot import driver, testing
@@ -72,6 +73,7 @@ def test_block_state_logger_writes_each_block(tmp_path):
         trial_ops=trial_ops,
         prop_ops=prop_ops,
         block_fn=make_block_state_logger(tmp_path),
+        sample_dir=tmp_path,
     )
 
     files = sorted(tmp_path.glob("block_state_*.npz"))
@@ -88,3 +90,12 @@ def test_block_state_logger_writes_each_block(tmp_path):
     all_states = load_all_prop_states_npz(tmp_path)
     assert len(all_states) == len(files)
     assert jnp.isfinite(out.mean_energy)
+
+    archives = list(tmp_path.glob("samples_*.npz"))
+    assert len(archives) == 1
+    with np.load(archives[0], allow_pickle=False) as saved:
+        assert saved["energies"].shape == (params.n_blocks,)
+        assert saved["weights"].shape == (params.n_blocks,)
+        assert saved["n_blocks_completed"] == params.n_blocks
+        assert saved["sampling_complete"]
+        np.testing.assert_allclose(saved["energies"], out.block_energies[-params.n_blocks:])

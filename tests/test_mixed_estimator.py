@@ -9,7 +9,9 @@ config.configure_once()
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
+from trot import driver
 from trot.core.ops import (
     BlockComponentEstimate,
     BlockComponentRetuneResult,
@@ -83,6 +85,7 @@ def _outlier_mixed_block(state, **kwargs):
             "guide_weight": jnp.asarray(4.0),
             "estimator_weight": jnp.asarray(1.0 + 0.0j),
             "estimator_components": components,
+            "estimator_test_diagnostic": block_index,
         },
         observables={},
     )
@@ -389,7 +392,8 @@ def test_component_estimator_outlier_mask_matches_historical_zeta_rule():
     assert not keep[12]
 
 
-def test_generic_mixed_estimator_driver_returns_named_components(capsys):
+def test_generic_mixed_estimator_driver_returns_named_components(capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     (
         sys,
         params,
@@ -442,9 +446,11 @@ def test_generic_mixed_estimator_driver_returns_named_components(capsys):
     assert "Estimator_E_avg" in output
     assert "[blk    2/25]" in output
     assert "[blk   25/25]" in output
+    assert "Raw production samples:" not in output
+    assert not list(tmp_path.iterdir())
 
 
-def test_generic_mixed_estimator_driver_cleans_outlier_and_preserves_raw_blocks(capsys):
+def test_generic_mixed_estimator_driver_cleans_outlier_and_preserves_raw_blocks(capsys, tmp_path):
     (
         sys,
         params,
@@ -466,6 +472,7 @@ def test_generic_mixed_estimator_driver_cleans_outlier_and_preserves_raw_blocks(
         estimator_data=jnp.asarray(0.0),
         estimator_ops=estimator_ops,
         mixed_block_fn=_outlier_mixed_block,
+        sample_dir=tmp_path,
         state=state,
         guide_meas_ctx=jnp.asarray(0.0),
         guide_prop_ctx=jnp.asarray(0.0),
@@ -483,6 +490,59 @@ def test_generic_mixed_estimator_driver_cleans_outlier_and_preserves_raw_blocks(
     assert result.estimator_analysis["n_retained_blocks"] == 24
     assert result.estimator_analysis["n_rejected_blocks"] == 1
     assert "rejected 1/25 projected-estimator blocks" in capsys.readouterr().out
+
+    files = list(tmp_path.glob("samples_*.npz"))
+    assert len(files) == 1
+    with np.load(files[0], allow_pickle=False) as saved:
+        np.testing.assert_array_equal(saved["components"], result.estimator_block_components)
+        np.testing.assert_array_equal(saved["weights"], result.estimator_block_weights)
+        np.testing.assert_array_equal(saved["keep_mask"], result.estimator_block_keep_mask)
+        np.testing.assert_array_equal(saved["proxy_energies"], result.estimator_block_proxy_energies)
+        np.testing.assert_array_equal(saved["component_names"], ["left", "right"])
+        np.testing.assert_array_equal(saved["diagnostic_estimator_test_diagnostic"], np.arange(25))
+        assert saved["n_blocks_completed"] == 25
+        assert saved["sampling_complete"]
+        # Reanalyse entirely from disk, with a different cleanup choice.
+        unfiltered = np.average(saved["components"], weights=saved["weights"], axis=0)
+        assert not np.isclose(_combine(saved["h0"], unfiltered), result.estimator_mean_energy)
+
+
+def test_mixed_estimator_interruption_leaves_last_reported_raw_samples(tmp_path, monkeypatch):
+    (sys, params, ham_data, state, guide_ops, guide_meas_ops,
+     guide_prop_ops, estimator_ops) = _make_case(n_blocks=25, n_eql_blocks=0)
+    analyze = driver._analyze_component_estimator_errors
+
+    def interrupt_after_saved_outlier(h0, weights, components, combine_energy, **kwargs):
+        if weights.size >= 15:
+            raise RuntimeError("simulated interruption during the next report")
+        return analyze(h0, weights, components, combine_energy, **kwargs)
+
+    monkeypatch.setattr(driver, "_analyze_component_estimator_errors", interrupt_after_saved_outlier)
+    # Saving must be explicitly enabled in the input, with a chosen directory.
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_mixed_estimator_qmc(
+            sys=sys, params=params, ham_data=ham_data,
+            guide_data=jnp.asarray(0.0), guide_ops=guide_ops,
+            guide_prop_ops=guide_prop_ops, guide_meas_ops=guide_meas_ops,
+            estimator_data=jnp.asarray(0.0), estimator_ops=estimator_ops,
+            mixed_block_fn=_outlier_mixed_block, state=state,
+            guide_meas_ctx=jnp.asarray(0.0), guide_prop_ctx=jnp.asarray(0.0),
+            estimator_ctx=jnp.asarray(0.0),
+            sample_dir=tmp_path / "samples",
+        )
+
+    files = list((tmp_path / "samples").glob("samples_*.npz"))
+    assert len(files) == 1
+    with np.load(files[0], allow_pickle=False) as saved:
+        assert saved["n_blocks_completed"] == 14
+        assert saved["n_blocks_requested"] == 25
+        assert not saved["sampling_complete"]
+        np.testing.assert_array_equal(saved["components"][12], [1000.0, 2.0])
+        assert not saved["keep_mask"][12]
+        assert np.iscomplexobj(saved["weights"])
+        np.testing.assert_array_equal(saved["guide_energies"], np.full(14, 5.75))
+        np.testing.assert_array_equal(saved["diagnostic_estimator_test_diagnostic"], np.arange(14))
 
 
 def test_generic_mixed_estimator_driver_uses_gamma_error_when_selected(capsys):

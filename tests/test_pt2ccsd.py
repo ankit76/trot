@@ -3,6 +3,7 @@ from trot import config
 config.configure_once()
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from pyscf import cc, gto, scf
 
@@ -116,7 +117,7 @@ _REFERENCES = {
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3, 4])
-def test_pt2ccsd_energy_matches_reference(h8_system, seed):
+def test_pt2ccsd_energy_matches_reference(h8_system, seed, tmp_path):
     """Run PT2-CCSD AFQMC with a fixed seed and check against a reference value.
 
     QmcParams: dt=0.005, n_walkers=1, n_prop_steps=1, n_blocks=100, n_eql_blocks=5.
@@ -147,10 +148,24 @@ def test_pt2ccsd_energy_matches_reference(h8_system, seed):
         trial_data=s["trial_data"],
         trial_meas_ops=s["trial_meas_ops"],
         mix_block_fn=block_mixed,
+        sample_dir=tmp_path,
     )
 
     e_mean = float(result.trial_mean_energy.real)
     e_err = float(result.trial_stderr_energy.real)
+
+    archives = list(tmp_path.glob("samples_*.npz"))
+    assert len(archives) == 1
+    with np.load(archives[0], allow_pickle=False) as saved:
+        assert saved["sampling_complete"]
+        assert saved["n_blocks_completed"] == params.n_blocks
+        for key, values in (
+            ("weights", result.trial_block_weights),
+            ("t2", result.trial_block_t2s),
+            ("e0", result.trial_block_e0s),
+            ("e1", result.trial_block_e1s),
+        ):
+            np.testing.assert_array_equal(saved[key], values[-params.n_blocks:])
 
     print(f"seed={seed}  E={e_mean:.6f}  err={e_err:.6f}  ref={e_ref:.6f} +/- {err_ref:.6f}")
 

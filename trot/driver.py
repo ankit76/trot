@@ -4,6 +4,7 @@ import dataclasses
 import math
 import time
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, NamedTuple, cast
 
 import jax
@@ -31,6 +32,7 @@ from .pair_sampling_runtime import prepare_local_cholesky_sampling
 from .prop.blocks import BlockFn, MixedBlockFn, MixedEstimatorBlockFn
 from .prop.types import PropOps, PropState, QmcParams, QmcParamsBase, QmcParamsFp
 from .runtime_layout import QmcRuntime
+from .sample_io import BlockSampleWriter
 from .stat_utils import (
     blocking_analysis_components,
     blocking_analysis_ratio,
@@ -899,6 +901,7 @@ def run_qmc(
     mesh: Mesh | None = None,
     observable_names: tuple[str, ...] = (),
     runtime: QmcRuntime | None = None,
+    sample_dir: str | Path | None = None,
 ) -> QmcResult:
     """
     equilibration blocks then sampling blocks.
@@ -906,6 +909,10 @@ def run_qmc(
     ``runtime`` transfers ownership of Hamiltonian/context replacements; normal
     Jobs supply it automatically. Separate array arguments are borrowed, so
     automatic Cholesky redistribution is disabled for that calling convention.
+
+    Set ``sample_dir`` to save raw block samples atomically to a unique NPZ
+    after each production progress report. Saving is disabled by default
+    (``sample_dir=None``). Equilibration is excluded.
 
     Returns:
       QmcResult with energy statistics plus block-level observable estimates.
@@ -1103,6 +1110,9 @@ def run_qmc(
     # sampling
     t_mark = time.perf_counter()
     print("\nSampling:\n")
+    sample_writer = BlockSampleWriter(
+        sample_dir, driver="qmc", sys=sys, params=params, h0=ham_data.h0,
+    )
     if target_error is None:
         target_error = 0.0
     print_every = params.n_blocks // 10 if params.n_blocks >= 10 else 0
@@ -1167,12 +1177,28 @@ def run_qmc(
             f"{elapsed:8.1f}"
             f"{diagnostic_text}"
         )
-        if (
+        stop_for_error = (
             np.isfinite(se)
             and (error_analysis.reliable or error_analysis.error_method == "blocking")
             and se <= target_error
             and target_error > 0.0
-        ):
+        )
+        if sample_writer.path is not None:
+            sample_writer.write(
+                start + n,
+                sampling_complete=start + n == params.n_blocks or stop_for_error,
+                energies=block_e_s,
+                weights=block_w_s,
+                **{
+                    f"observable_{name}": jnp.concatenate(chunks)
+                    for name, chunks in block_obs_s.items()
+                },
+                **{
+                    f"diagnostic_{name}": jnp.concatenate(chunks)
+                    for name, chunks in block_diagnostics_s.items()
+                },
+            )
+        if stop_for_error:
             print(f"\nTarget error {target_error:.3e} reached at block {start + n}.")
             break
     block_e_s = jnp.asarray(block_e_s)
@@ -1327,6 +1353,7 @@ def run_mixed_estimator_qmc(
     estimator_outlier_zeta: float | None = 20.0,
     mesh: Mesh | None = None,
     runtime: QmcRuntime | None = None,
+    sample_dir: str | Path | None = None,
 ) -> MixedEstimatorQmcResult:
     """Run one guide trajectory and evaluate arbitrary projected components.
 
@@ -1345,6 +1372,11 @@ def run_mixed_estimator_qmc(
     default, the reported projected estimate also applies the historical
     PT2-CCSD block cleanup at ``zeta=20``. Raw block arrays are retained in the
     result, together with the proxy energies and keep mask.
+
+    Set ``sample_dir`` to save raw components, weights, cleanup masks and
+    diagnostics atomically to a unique NPZ after each production progress
+    report. Rejected blocks remain in the archive for offline filtering.
+    Saving is disabled by default (``sample_dir=None``).
 
     Use ``runtime=QmcRuntime(...)`` (or ``job.prepare_runtime()``) to let the
     driver replace Cholesky-indexed inputs without retaining the old layout.
@@ -1662,6 +1694,14 @@ def run_mixed_estimator_qmc(
                 )
 
     print("\nMixed-estimator sampling:\n")
+    sample_writer = BlockSampleWriter(
+        sample_dir, driver="mixed_estimator", sys=sys, params=params, h0=ham_data.h0,
+        component_names=estimator_ops.component_names,
+        guide_energy_label=shift_energy_label,
+        estimator_outlier_zeta=(
+            np.nan if estimator_outlier_zeta is None else estimator_outlier_zeta
+        ),
+    )
     sampling_started = time.perf_counter()
     sampling_mark = sampling_started
     print_every = params.n_blocks // 10 if params.n_blocks >= 10 else 0
@@ -1709,7 +1749,7 @@ def run_mixed_estimator_qmc(
             guide_block_weights_so_far,
             error_method=params.error_method,
         )
-        _, estimator_progress_keep = component_estimator_outlier_mask(
+        estimator_progress_proxy, estimator_progress_keep = component_estimator_outlier_mask(
             ham_data.h0,
             estimator_block_weights_so_far,
             estimator_block_components_so_far,
@@ -1762,6 +1802,21 @@ def run_mixed_estimator_qmc(
             f"{batch_finished - run_started:8.1f}"
             f"{diagnostic_text}"
         )
+        if sample_writer.path is not None:
+            sample_writer.write(
+                start + n,
+                sampling_complete=start + n == params.n_blocks,
+                guide_energies=guide_block_energies_so_far,
+                guide_weights=guide_block_weights_so_far,
+                weights=estimator_block_weights_so_far,
+                components=estimator_block_components_so_far,
+                proxy_energies=estimator_progress_proxy,
+                keep_mask=estimator_progress_keep,
+                **{
+                    f"diagnostic_{name}": jnp.concatenate(chunks)
+                    for name, chunks in guide_diagnostic_chunks.items()
+                },
+            )
         sampling_mark = batch_finished
 
     elapsed = time.perf_counter() - sampling_started
@@ -1877,11 +1932,15 @@ def run_mixed_qmc(
     target_error: float | None = None,
     mesh: Mesh | None = None,
     observable_names: tuple[str, ...] = (),
+    sample_dir: str | Path | None = None,
 ) -> MixedQmcResult:
     """
     equilibration blocks then sampling blocks.
     Guide != Trial
     Currently only support pt2CCSD trial without observables
+
+    Set ``sample_dir`` to save raw production samples after each progress
+    report to a unique NPZ. Saving is disabled by default (``sample_dir=None``).
 
     Returns:
       MixedQmcResult with energy statistics plus block-level observable estimates.
@@ -2045,6 +2104,10 @@ def run_mixed_qmc(
 
     # sampling
     print("\nSampling:\n")
+    sample_writer = BlockSampleWriter(
+        sample_dir, driver="mixed_pt2ccsd", sys=sys, params=params, h0=ham_data.h0,
+        error_method="blocking",
+    )
     if target_error is None:
         target_error = 0.0
     print_every = params.n_blocks // 10 if params.n_blocks >= 10 else 0
@@ -2125,7 +2188,20 @@ def run_mixed_qmc(
             f"{dt_per_block:9.3f}  "
             f"{elapsed:8.1f}"
         )
-        if guide_se is not None and guide_se <= target_error and target_error > 0.0:
+        stop_for_error = (
+            guide_se is not None and guide_se <= target_error and target_error > 0.0
+        )
+        sample_writer.write(
+            start + n,
+            sampling_complete=start + n == params.n_blocks or stop_for_error,
+            guide_energies=guide_block_e_sp,
+            guide_weights=guide_block_w_sp,
+            weights=trial_block_w_sp,
+            t2=trial_block_t2_sp,
+            e0=trial_block_e0_sp,
+            e1=trial_block_e1_sp,
+        )
+        if stop_for_error:
             print(f"\nTarget error {target_error:.3e} reached at block {start + n}.")
             break
 
@@ -2237,6 +2313,7 @@ def run_qmc_energy(
     prop_ctx: Any | None = None,
     target_error: float | None = None,
     mesh: Mesh | None = None,
+    sample_dir: str | Path | None = None,
 ) -> tuple[float, float, jax.Array, jax.Array]:
     out = run_qmc(
         sys=sys,
@@ -2253,6 +2330,7 @@ def run_qmc_energy(
         target_error=target_error,
         mesh=mesh,
         observable_names=(),
+        sample_dir=sample_dir,
     )
     return (
         float(out.mean_energy),
