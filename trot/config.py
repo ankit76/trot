@@ -2,10 +2,34 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import socket
 import sys
 import warnings
 from dataclasses import dataclass
+
+
+# An OOM on one GPU can strand the other ranks in Acquire/Initialize clique.
+# XLA otherwise leaves these NCCL rendezvous waiting indefinitely. Its timeout
+# starts after the initial 10-second warning. Allow another 30 minutes so a
+# slow but recoverable communicator initialization does not abort the run.
+_GPU_FAILURE_XLA_DEFAULTS = {
+    "--xla_gpu_nccl_termination_timeout_seconds": "1800",
+    "--xla_gpu_nccl_terminate_on_error": "true",
+}
+
+
+def _set_gpu_failure_defaults() -> None:
+    """Bound native GPU synchronization failures; preserve explicit XLA flags."""
+    flags = os.environ.get("XLA_FLAGS", "")
+    configured = {token.split("=", 1)[0] for token in shlex.split(flags)}
+    additions = [
+        f"{name}={value}"
+        for name, value in _GPU_FAILURE_XLA_DEFAULTS.items()
+        if name not in configured
+    ]
+    if additions:
+        os.environ["XLA_FLAGS"] = " ".join([flags, *additions]).strip()
 
 
 def is_jupyter_notebook() -> bool:
@@ -110,6 +134,11 @@ def configure_once(
     over ``JAX_DEFAULT_MATMUL_PRECISION``, which otherwise overrides the
     ``afqmc_config`` default. This does not change array storage dtypes.
     Call before importing ``trot.afqmc`` or tracing any JAX computations.
+
+    GPU configuration also enables fatal asynchronous collective errors and a
+    30-minute NCCL rendezvous termination timeout after XLA's initial warning.
+    Explicit values in ``XLA_FLAGS`` override these defaults. Configure before
+    importing JAX so the native runtime sees the settings at initialization.
     """
     global _configured_once
     if _configured_once:
@@ -182,12 +211,15 @@ def setup_jax(
         use_gpu = _detect_gpu() and os.environ.get("JAX_PLATFORM_NAME") != "cpu"
     afqmc_config.use_gpu = use_gpu
 
+    if use_gpu:
+        _set_gpu_failure_defaults()
+
     # env vars only take effect if JAX hasn't been imported yet
     if jax_already_imported and use_gpu:
         warnings.warn(
             "JAX was imported before AFQMC configuration; "
-            "GPU memory settings (XLA_PYTHON_CLIENT_PREALLOCATE, "
-            "XLA_PYTHON_CLIENT_ALLOCATOR) may not take effect. "
+            "GPU memory settings and XLA collective-failure settings "
+            "may not take effect. "
             "For full control, call config.configure_once(...) before importing jax.",
             stacklevel=3,
         )

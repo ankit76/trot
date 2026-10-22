@@ -77,6 +77,27 @@ Python. An explicit argument overrides the environment setting. This policy
 controls matrix-product arithmetic independently of mixed-precision array
 storage; selecting `"highest"` does not promote float32 arrays to float64.
 
+GPU configuration adds two defaults to `XLA_FLAGS` before JAX initializes:
+`--xla_gpu_nccl_termination_timeout_seconds=1800` and
+`--xla_gpu_nccl_terminate_on_error=true`. The first aborts the process when
+GPU ranks cannot complete an NCCL communicator rendezvous, including the case
+where an out-of-memory error prevents one rank from joining `Acquire clique`.
+XLA emits its initial warning after 10 seconds and allows another 30 minutes
+before terminating. A warning alone is not fatal: slow communicator
+initialization can recover within the grace period. The second setting makes
+detected asynchronous collective errors
+fatal. These controls bound native synchronization failures; they do not impose
+a time limit on compilation, calibration, or a sampling block. They also do not
+cover every possible GPU hang or prevent allocation failures.
+
+Call `config.configure_once(...)` before importing JAX. Explicit settings already
+present in `XLA_FLAGS` take precedence, and unrelated flags are preserved.
+The fatal exit is handled by the existing batch script's `set -e`, allowing the
+allocation to end instead of remaining alive with idle GPUs. Configure these
+settings when launching a new process; they cannot change an already running job.
+The behavior follows XLA's [GPU clique handling](https://github.com/openxla/xla/blob/main/xla/backends/gpu/collectives/gpu_cliques.cc)
+and [rendezvous timeout](https://github.com/openxla/xla/blob/main/xla/service/rendezvous.cc).
+
 With mixed precision, the FP32 VHS Cholesky copy stores only the upper triangle
 for real factors, assuming the symmetric matrices produced by molecular staging.
 This decision uses the input dtype only; no numerical symmetry scan is performed.
