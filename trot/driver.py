@@ -1787,7 +1787,9 @@ def run_mixed_estimator_qmc(
                 [],
             )
         if noise_chunks:
-            noise_values = jnp.concatenate(noise_chunks)
+            # Match the blocks used for the reported projected-estimator energy.
+            # The diagnostics saved below remain raw for offline analysis.
+            noise_values = jnp.concatenate(noise_chunks)[estimator_progress_keep]
             noise_rms_mha = 1000.0 * jnp.sqrt(jnp.mean(noise_values**2))
             diagnostic_text = f"  tail_rms={float(noise_rms_mha):.3f} mHa"
         print(

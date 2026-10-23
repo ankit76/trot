@@ -355,7 +355,9 @@ production counts, and `sampling_complete`. The arrays are never filtered:
   more blocks arrive. Recompute it with `component_estimator_outlier_mask`
   when choosing a different cleanup threshold; combine **weighted component
   means** using the same estimator's `combine_energy`, rather than averaging
-  the per-block proxy energies.
+  the per-block proxy energies. The mixed-estimator progress `tail_rms` uses
+  the same retained-block mask as `Estimator_E_avg`; the diagnostic arrays
+  saved in the archive remain raw.
 - Legacy PT2-CCSD: raw `weights`, `t2`, `e0`, `e1`, `guide_energies`, and
   `guide_weights`; these can be passed through the existing cleanup and
   `pt2ccsd_blocking` analysis.
